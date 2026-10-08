@@ -9,6 +9,7 @@ Controls
     W / UP / SPACE            jump over low barriers
     S / DOWN                  superhero slide under high hazards
     F                         unleash GLORIOUS PURPOSE (when the meter is full)
+    F11 or Cmd+F              toggle fullscreen
     P                         pause          ENTER  start / restart     ESC  quit
 
 Architecture
@@ -1308,7 +1309,7 @@ class Game:
     def __init__(self):
         pygame.init()
         pygame.display.set_caption("LokiMan -- Burdened With Glorious Purpose")
-        self.screen = pygame.display.set_mode((W, H))
+        self.screen = pygame.display.set_mode((W, H), pygame.SCALED | pygame.RESIZABLE)
         self.world = pygame.Surface((W, H))
         self.clock = pygame.time.Clock()
         self.state = GameState()
@@ -1329,6 +1330,8 @@ class Game:
         elif e.type == pygame.KEYDOWN:
             if e.key == pygame.K_ESCAPE:
                 self.running = False
+            elif e.key == pygame.K_F11 or (e.key == pygame.K_f and e.mod & (pygame.KMOD_META | pygame.KMOD_CTRL)):
+                pygame.display.toggle_fullscreen()
             elif e.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
                 if st.mode in (st.TITLE, st.GAME_OVER, st.VICTORY):
                     st.start_game()
