@@ -10,6 +10,7 @@ Controls
     S / DOWN                  superhero slide under high hazards
     F                         unleash GLORIOUS PURPOSE (when the meter is full)
     F11 or Cmd+F              toggle fullscreen
+    M                         mute / unmute
     P                         pause          ENTER  start / restart     ESC  quit
 
 Architecture
@@ -32,6 +33,7 @@ import pygame
 # --------------------------------------------------------------------------
 W, H = 960, 640
 FPS = 60
+SIM_DT = 1 / 120.0
 HORIZON = 230            # screen y of the vanishing line
 PLAYER_Y = 560           # screen y of Loki's feet (scale == 1)
 LANE_W = 170             # pixels between lane centres at scale 1
@@ -124,6 +126,26 @@ def draw_text(surf, txt, size, color, pos, anchor="center", outline=BLACK, ow=3)
     return img
 
 
+_fill_cache = {}
+
+
+def fill_alpha(surf, rect, color, alpha):
+    """Blit a cached translucent colour block (avoids per-frame surface allocation)."""
+    rect = pygame.Rect(rect)
+    if alpha <= 0 or rect.w <= 0 or rect.h <= 0:
+        return
+    key = (rect.w, rect.h, color)
+    img = _fill_cache.get(key)
+    if img is None:
+        if len(_fill_cache) > 60:
+            _fill_cache.clear()
+        img = pygame.Surface(rect.size)
+        img.fill(color)
+        _fill_cache[key] = img
+    img.set_alpha(int(clamp(alpha, 0, 255)))
+    surf.blit(img, rect.topleft)
+
+
 _glow_cache = {}
 
 
@@ -197,9 +219,16 @@ def draw_cube(surf, cx, cy, r, spin=0.0, glow=True):
 class LaneManager:
     COUNT = 3
 
+    def __init__(self):
+        self.cam = 0.0           # camera sway (lane units) that follows Loki
+
     @staticmethod
     def lane_x(lane):
         return lane - 1
+
+    def px(self, lx):
+        """Screen x of lane position lx on the player's line (scale 1)."""
+        return W / 2 + (lx - self.cam) * LANE_W
 
     def clamp_lane(self, lane):
         return int(clamp(lane, 0, self.COUNT - 1))
@@ -211,7 +240,7 @@ class LaneManager:
     def project(self, lx, dist):
         """lane-unit x and world distance -> (screen x, screen y, scale)."""
         s = self.scale(dist)
-        return W / 2 + lx * LANE_W * s, HORIZON + (PLAYER_Y - HORIZON) * s, s
+        return W / 2 + (lx - self.cam) * LANE_W * s, HORIZON + (PLAYER_Y - HORIZON) * s, s
 
     def draw_ground(self, surf, level, travel):
         pal = level.pal
@@ -219,7 +248,7 @@ class LaneManager:
         pygame.draw.rect(surf, pal["ground"], (0, HORIZON, W, H - HORIZON))
         k0 = int(travel // BAND)
         off = travel - k0 * BAND
-        cx = W / 2
+        cam = self.cam
         for i in range(int(FAR / BAND) + 1, -1, -1):
             d0 = i * BAND - off
             d1 = d0 + BAND
@@ -231,8 +260,8 @@ class LaneManager:
 
             def quad(l0, l1, col, s0=s0, s1=s1, y0=y0, y1=y1, fog=fog):
                 pygame.draw.polygon(surf, mix(col, pal["fog"], fog),
-                                    [(cx + l0 * LANE_W * s0, y0), (cx + l1 * LANE_W * s0, y0),
-                                     (cx + l1 * LANE_W * s1, y1), (cx + l0 * LANE_W * s1, y1)])
+                                    [(W / 2 + (l0 - cam) * LANE_W * s0, y0), (W / 2 + (l1 - cam) * LANE_W * s0, y0),
+                                     (W / 2 + (l1 - cam) * LANE_W * s1, y1), (W / 2 + (l0 - cam) * LANE_W * s1, y1)])
 
             side = pal["side_a"] if k % 2 == 0 else pal["side_b"]
             quad(-3.8, -ROAD_HALF, side)
@@ -346,6 +375,7 @@ class Level:
     # ----- roadside scenery -----
     def draw_decor(self, surf, lm, travel):
         sp = self.DECOR_SPACING
+        self.cam = lm.cam
         k0 = int(travel // sp)
         fn = getattr(self, "_decor_" + self.theme)
         for k in range(k0 + int(FAR / sp) + 1, k0 - 1, -1):
@@ -358,22 +388,34 @@ class Level:
             for side in (-1, 1):
                 fn(surf, k, side, s, sy, fog)
 
+    _facades = {}
+
+    def _facade(self, variant, w, h):
+        """Pre-rendered window grid for a city building, scaled to w x h."""
+        base = self._facades.get(variant)
+        if base is None:
+            fw, fh = 340, 600
+            base = pygame.Surface((fw, fh))
+            base.fill(mix((38, 42, 66), (74, 60, 84), variant / 5.0))
+            for wy in range(18, fh - 8, 30):
+                for wx in range(12, fw - 16, 26):
+                    c = (255, 215, 120) if hrand(wx + variant * 31, wy, variant) > 0.55 else (22, 24, 40)
+                    pygame.draw.rect(base, c, (wx, wy, 12, 16))
+            self._facades[variant] = base
+        return pygame.transform.scale(base, (max(2, w), max(2, h)))
+
     def _fogc(self, c, fog):
         return mix(c, self.pal["fog"], fog)
 
     def _decor_city(self, surf, k, side, s, sy, fog):
+        cx = W / 2 - self.cam * LANE_W * s
         r1, r2, r3 = hrand(k, side, 1), hrand(k, side, 2), hrand(k, side, 3)
         bw, bh = (1.9 + r2 * 0.6) * LANE_W * s, (230 + r3 * 330) * s
-        bx = W / 2 + side * (3.05 + r1 * 0.4) * LANE_W * s
-        col = self._fogc(mix((38, 42, 66), (74, 60, 84), r2), fog)
-        pygame.draw.rect(surf, col, (bx - bw / 2, sy - bh, bw, bh + 2))
-        if s > 0.12:
-            wc = self._fogc((255, 215, 120), fog)
-            dark = self._fogc((22, 24, 40), fog)
-            for wy in range(18, int(bh / s) - 8, 30):
-                for wx in range(-int(bw / s / 2) + 12, int(bw / s / 2) - 16, 26):
-                    c = wc if hrand(k * 7 + wx, side, wy) > 0.55 else dark
-                    pygame.draw.rect(surf, c, (bx + wx * s, sy - bh + wy * s, 12 * s, 16 * s))
+        bx = cx + side * (3.05 + r1 * 0.4) * LANE_W * s
+        fac = self._facade(int(r2 * 5.99), int(bw), int(bh))
+        pygame.draw.rect(surf, self.pal["fog"], (bx - bw / 2, sy - bh, bw, bh + 2))
+        fac.set_alpha(int(255 * (1 - fog)))
+        surf.blit(fac, (bx - fac.get_width() / 2, sy - bh))
         if r1 > 0.55:                                          # burning rooftop
             t = pygame.time.get_ticks() / 1000.0
             for j in range(3):
@@ -382,20 +424,21 @@ class Level:
                 pygame.draw.circle(surf, (255, 120, 20), (int(fx), int(sy - bh - fh * 0.3)), max(1, int(fh * 0.7)))
                 pygame.draw.circle(surf, (255, 220, 60), (int(fx), int(sy - bh - fh * 0.2)), max(1, int(fh * 0.4)))
         if k % 2 == 0:                                         # street lamp
-            lx = W / 2 + side * 1.62 * LANE_W * s
+            lx = cx + side * 1.62 * LANE_W * s
             pygame.draw.rect(surf, self._fogc((90, 90, 96), fog), (lx - 3 * s, sy - 150 * s, 6 * s + 1, 150 * s))
             pygame.draw.rect(surf, self._fogc((255, 240, 160), fog), (lx - (side * 22 + 4) * s, sy - 154 * s, 28 * s, 7 * s))
 
     def _decor_tva(self, surf, k, side, s, sy, fog):
+        cx = W / 2 - self.cam * LANE_W * s
         c1, c2 = ((205, 112, 42), (178, 92, 34)) if k % 2 == 0 else ((178, 92, 34), (205, 112, 42))
-        x_in = W / 2 + side * 1.75 * LANE_W * s
-        x_out = W / 2 + side * 9 * LANE_W * s
+        x_in = cx + side * 1.75 * LANE_W * s
+        x_out = cx + side * 9 * LANE_W * s
         x0, x1 = min(x_in, x_out), max(x_in, x_out)
         ch = 430 * s
         pygame.draw.rect(surf, self._fogc(c1, fog), (x0, sy - ch, x1 - x0, ch + 2))
         pygame.draw.rect(surf, self._fogc((92, 50, 24), fog), (x0, sy - ch, x1 - x0, 10 * s + 1))   # cornice
         pygame.draw.rect(surf, self._fogc((92, 50, 24), fog), (x0, sy - 40 * s, x1 - x0, 40 * s + 2))  # skirting
-        dx = W / 2 + side * 2.55 * LANE_W * s
+        dx = cx + side * 2.55 * LANE_W * s
         dw, dh = 0.9 * LANE_W * s, 290 * s
         pygame.draw.rect(surf, self._fogc((110, 62, 30), fog), (dx - dw / 2, sy - 40 * s - dh, dw, dh))
         pygame.draw.rect(surf, self._fogc((240, 200, 120), fog), (dx - dw * 0.3, sy - 40 * s - dh * 0.75, dw * 0.6, dh * 0.2))
@@ -403,12 +446,13 @@ class Level:
         pygame.draw.rect(surf, self._fogc(c2, fog), (x_in - pillar_w / 2 - side * pillar_w * 0.3, sy - ch, pillar_w, ch + 2))
         if k % 2 == 0:                                           # ceiling light panels
             lw = 3.0 * LANE_W * s
-            pygame.draw.rect(surf, self._fogc((92, 50, 24), fog), (W / 2 - lw * 0.75, sy - ch - 4 * s, lw * 1.5, 12 * s + 1))
-            pygame.draw.rect(surf, self._fogc((255, 245, 200), fog), (W / 2 - lw / 2, sy - ch - 2 * s, lw, 8 * s + 1))
+            pygame.draw.rect(surf, self._fogc((92, 50, 24), fog), (cx - lw * 0.75, sy - ch - 4 * s, lw * 1.5, 12 * s + 1))
+            pygame.draw.rect(surf, self._fogc((255, 245, 200), fog), (cx - lw / 2, sy - ch - 2 * s, lw, 8 * s + 1))
 
     def _decor_void(self, surf, k, side, s, sy, fog):
+        cx = W / 2 - self.cam * LANE_W * s
         r1, r2, r3 = hrand(k, side, 1), hrand(k, side, 2), hrand(k, side, 3)
-        bx = W / 2 + side * (2.5 + r1 * 2.2) * LANE_W * s
+        bx = cx + side * (2.5 + r1 * 2.2) * LANE_W * s
         w, h = (0.8 + r2 * 0.9) * LANE_W * s, (130 + r3 * 400) * s
         col = self._fogc(mix((54, 30, 82), (96, 52, 140), r2), fog)
         pygame.draw.polygon(surf, col, [(bx - w / 2, sy), (bx + (r2 - 0.5) * w * 0.4, sy - h), (bx + w / 2, sy)])
@@ -751,9 +795,8 @@ class Banner:
         k = pop * fit
         img = pygame.transform.rotozoom(img, math.sin(t * 6) * 3, k)
         img.set_alpha(int(255 * fade))
-        band = pygame.Surface((W, int(img.get_height() * 0.8)), pygame.SRCALPHA)
-        band.fill((0, 0, 0, int(110 * fade)))
-        surf.blit(band, (0, y - band.get_height() // 2))
+        bh = int(img.get_height() * 0.8) // 4 * 4
+        fill_alpha(surf, (0, y - bh // 2, W, bh), BLACK, 110 * fade)
         surf.blit(img, img.get_rect(center=(W // 2 + math.sin(t * 40) * 2 * math.exp(-t * 6), y)))
 
 
@@ -799,24 +842,30 @@ class Player:
 
     def move(self, d):
         if not self.can_act:
-            return
+            return False
         new = self.lm.clamp_lane(self.lane + d)
         if new != self.lane:
             self.lane = new
             self.ghosts.append([self.x, self.jump_h, 0.4, self.pose(), int(self.run_phase * 2) % 12])
+            return True
+        return False
 
     def jump(self):
         if self.can_act and self.jump_h <= 0 and not self.sliding:
             self.vy = JUMP_V
+            return True
+        return False
 
     def slide(self):
         if not self.can_act:
-            return
+            return False
         if self.jump_h > 0:
             self.vy = min(self.vy, -700)       # slam down, slide on landing
             self.pending_slide = True
-        else:
+        elif self.slide_t <= 0:
             self.slide_t = SLIDE_TIME
+            return True
+        return False
 
     def start_tumble(self):
         self.tumble = TUMBLE_TIME
@@ -843,13 +892,14 @@ class Player:
         self.time += dt
         self.run_phase += dt * (6 + speed * 0.25)
         target = self.lm.lane_x(self.lane)
-        if abs(self.x - target) > 1e-3:
+        if abs(self.x - target) > 0.01:
             self.ghost_t -= dt
             if self.ghost_t <= 0:
                 self.ghosts.append([self.x, self.jump_h, 0.35, self.pose(), int(self.run_phase * 2) % 12])
                 self.ghost_t = 0.03
-            step = LANE_SPEED * dt
-            self.x += clamp(target - self.x, -step, step)
+            diff = target - self.x
+            step = max(LANE_SPEED * 0.35 * dt, abs(diff) * (1 - math.exp(-22 * dt)))
+            self.x += clamp(diff, -step, step)
         else:
             self.x = target
         if self.jump_h > 0 or self.vy > 0:
@@ -944,7 +994,7 @@ class Player:
         return g
 
     def draw(self, surf, t):
-        sx = W / 2 + self.x * LANE_W
+        sx = self.lm.px(self.x)
         gy = PLAYER_Y
         # shadow
         sh = clamp(1 - self.jump_h / 220, 0.35, 1)
@@ -954,7 +1004,7 @@ class Player:
         for x, h, life, pose, frame in self.ghosts:
             img = self.ghost_img(pose, frame)
             img.set_alpha(int(170 * life / 0.4))
-            surf.blit(img, img.get_rect(midbottom=(W / 2 + x * LANE_W, gy - h)))
+            surf.blit(img, img.get_rect(midbottom=(self.lm.px(x), gy - h)))
         if self.invuln > 0 and self.tumble <= 0 and self.fall <= 0 and self.aura <= 0 and int(t * 18) % 2:
             return
         cy = gy - self.jump_h
@@ -1009,6 +1059,7 @@ class GameState:
         self.shake = 0.0
         self.flash = 0.0
         self.flash_color = WHITE
+        self.sfx_queue = []
         self.reset_run()
 
     @property
@@ -1040,9 +1091,13 @@ class GameState:
         self.reset_run()
         self.mode = self.PLAYING
         self.card_t = 3.6
+        self.sound("start")
         self.add_banner("BURDENED WITH GLORIOUS PURPOSE!", (110, 255, 140), 2.8)
 
     # -- fx -------------------------------------------------------------
+    def sound(self, name):
+        self.sfx_queue.append(name)
+
     def add_banner(self, text, color, dur=2.4):
         self.banners.append(Banner(text, color, dur))
         if len(self.banners) > 3:
@@ -1070,13 +1125,17 @@ class GameState:
             return
         p = self.player
         if name == "left":
-            p.move(-1)
+            if p.move(-1):
+                self.sound("lane")
         elif name == "right":
-            p.move(1)
+            if p.move(1):
+                self.sound("lane")
         elif name == "jump":
-            p.jump()
+            if p.jump():
+                self.sound("jump")
         elif name == "slide":
-            p.slide()
+            if p.slide():
+                self.sound("slide")
         elif name == "aura":
             self.activate_aura()
 
@@ -1084,6 +1143,7 @@ class GameState:
         p = self.player
         if self.meter >= 100 and p.aura <= 0 and p.can_act:
             p.aura = AURA_TIME
+            self.sound("aura")
             self.add_banner("LOVE IS A DAGGER!", (90, 255, 150), 2.4)
             self.flash, self.flash_color = 0.25, (80, 255, 140)
             self.shake = 0.35
@@ -1093,6 +1153,7 @@ class GameState:
 
     def blast_obstacle(self, o):
         o.blast(1 if o.lane_x >= self.player.x else -1)
+        self.sound("blast")
         self.score += 150
         sx, sy, _ = self.lm.project(o.lane_x, max(o.dist, 0))
         self.particles.append(Particle(sx, sy - 120, 0, -70, 0.9, (120, 255, 150), kind="text", text="+150"))
@@ -1104,6 +1165,7 @@ class GameState:
         self.t += dt
         self.update_fx(dt)
         p = self.player
+        self.lm.cam += (p.x * 0.4 - self.lm.cam) * min(1.0, 5 * dt)
         if self.mode == self.TITLE:
             self.travel += 14 * dt
             p.update(dt, 14)
@@ -1151,7 +1213,7 @@ class GameState:
             for o in self.obstacles:
                 if o.active and o.kind != "pit" and o.dist < 16 and abs(o.lane_x - p.x) < 1.7:
                     self.blast_obstacle(o)
-            sx = W / 2 + p.x * LANE_W
+            sx = self.lm.px(p.x)
             self.particles.append(Particle(sx + random.uniform(-50, 50), PLAYER_Y - p.jump_h - random.uniform(10, 150),
                                            random.uniform(-30, 30), -random.uniform(60, 160), 0.6, (110, 255, 160), 5))
         elif self.meter > 100:
@@ -1226,12 +1288,14 @@ class GameState:
                 c.collected = True
                 self.tess += 1
                 self.score += 50
+                self.sound("collect%d" % (self.tess % 5))
                 if p.aura <= 0:
                     self.meter = min(100.0, self.meter + METER_GAIN)
                     if self.meter >= 100 and not self.meter_ready_said:
                         self.meter_ready_said = True
+                        self.sound("ready")
                         self.add_banner("PRESS F FOR GLORIOUS PURPOSE!", (120, 220, 255), 1.8)
-                self.burst(W / 2 + c.lane_x * LANE_W, PLAYER_Y - 60, CYAN, 8, 200, 4, 300)
+                self.burst(self.lm.px(c.lane_x), PLAYER_Y - 60, CYAN, 8, 200, 4, 300)
         if not p.vulnerable():
             return
         for o in self.obstacles:
@@ -1259,11 +1323,13 @@ class GameState:
         if o.kind == "pit":
             o.hit = True
             p.start_fall()
+            self.sound("fall")
             self.add_banner("I'VE BEEN FALLING FOR 30 MINUTES!", (120, 230, 255), 2.8)
         else:
             o.blast(1 if o.lane_x >= p.x else -1)
             o.hit = True
             p.start_tumble()
+            self.sound("hit")
             self.flash, self.flash_color = 0.18, (255, 70, 60)
             if o.kind == "heavy":
                 self.add_banner("PUNY GOD!", (255, 90, 70), 2.0)
@@ -1273,7 +1339,7 @@ class GameState:
             self.tess -= lost
             self.meter = max(0.0, self.meter - 25)
             self.meter_ready_said = self.meter >= 100
-            sx, sy = W / 2 + p.x * LANE_W, PLAYER_Y - 90
+            sx, sy = self.lm.px(p.x), PLAYER_Y - 90
             for _ in range(lost):                                    # scatter!
                 a = random.uniform(-math.pi, 0)
                 v = random.uniform(180, 420)
@@ -1282,6 +1348,7 @@ class GameState:
             self.burst(sx, sy, GOLD, 14)
         if self.lives <= 0:
             self.mode = self.GAME_OVER
+            self.sound("gameover")
             self.add_banner("THE TRICKSTER HAS FALLEN...", (255, 120, 120), 3.5)
 
     def finish_level(self):
@@ -1289,10 +1356,12 @@ class GameState:
         if self.level_idx >= len(self.levels) - 1:
             self.score += self.lives * 500 + self.tess * 10
             self.mode = self.VICTORY
+            self.sound("victory")
             self.banners.clear()
             self.flash, self.flash_color = 0.6, GOLD
             return
         self.level_idx += 1
+        self.sound("clear")
         self.level_dist = 0.0
         self.next_spawn = 70.0
         self.obstacles.clear()
@@ -1303,17 +1372,191 @@ class GameState:
 
 
 # --------------------------------------------------------------------------
+# Audio: every sound is synthesised at start-up (no asset files needed)
+# --------------------------------------------------------------------------
+class Audio:
+    RATE = 22050
+
+    def __init__(self):
+        self.ok = False
+        self.muted = False
+        self.sfx = {}
+        self.music = None
+        self.music_ch = None
+        try:
+            if not pygame.mixer.get_init():
+                pygame.mixer.init(self.RATE, -16, 1, 512)
+            self.rate, _, self.channels = pygame.mixer.get_init()
+            pygame.mixer.set_num_channels(16)
+            self.build()
+            self.ok = True
+        except Exception:
+            self.ok = False
+
+    # -- synthesis helpers ----------------------------------------------
+    @staticmethod
+    def wave(kind, ph, duty=0.5):
+        ph %= 1.0
+        if kind == "sq":
+            return 1.0 if ph < duty else -1.0
+        if kind == "tri":
+            return 4 * abs(ph - 0.5) - 1
+        if kind == "saw":
+            return 2 * ph - 1
+        return math.sin(ph * math.tau)
+
+    def tone(self, buf, start, dur, f0, f1=None, kind="sq", vol=0.5, duty=0.5, attack=0.004, vib=0.0):
+        """Mix a note (optionally gliding f0 -> f1) into buf starting at `start` seconds."""
+        r = self.rate
+        f1 = f0 if f1 is None else f1
+        n = int(dur * r)
+        i0 = int(start * r)
+        ph = 0.0
+        for i in range(n):
+            if i0 + i >= len(buf):
+                break
+            t = i / n
+            f = f0 + (f1 - f0) * t
+            if vib:
+                f *= 1 + vib * math.sin(i / r * 40)
+            ph += f / r
+            env = min(1.0, i / max(1, attack * r)) * (1 - t) ** 1.5
+            buf[i0 + i] += self.wave(kind, ph, duty) * vol * env
+
+    def noise(self, buf, start, dur, vol=0.5, lp=0.5, lp_end=None):
+        r = self.rate
+        n = int(dur * r)
+        i0 = int(start * r)
+        lp_end = lp if lp_end is None else lp_end
+        y = 0.0
+        for i in range(n):
+            if i0 + i >= len(buf):
+                break
+            t = i / n
+            a = lp + (lp_end - lp) * t
+            y += (random.uniform(-1, 1) - y) * a
+            buf[i0 + i] += y * vol * (1 - t) ** 1.5
+
+    def to_sound(self, buf, gain=1.0):
+        from array import array
+        data = array("h")
+        for v in buf:
+            v = int(clamp(v * gain, -1.0, 1.0) * 30000)
+            data.append(v)
+            if self.channels == 2:
+                data.append(v)
+        return pygame.mixer.Sound(buffer=data.tobytes())
+
+    def make(self, dur, fn, gain=0.7):
+        buf = [0.0] * int(dur * self.rate)
+        fn(buf)
+        return self.to_sound(buf, gain)
+
+    def build(self):
+        T, N = self.tone, self.noise
+        S = self.sfx
+        S["jump"] = self.make(0.22, lambda b: T(b, 0, 0.2, 280, 760, "sq", 0.45, 0.25))
+        S["slide"] = self.make(0.38, lambda b: (N(b, 0, 0.36, 0.7, 0.5, 0.06), T(b, 0, 0.3, 220, 90, "tri", 0.3)))
+        S["lane"] = self.make(0.1, lambda b: (N(b, 0, 0.09, 0.5, 0.7, 0.2), T(b, 0, 0.08, 520, 300, "sin", 0.3)))
+        pent = (784, 880, 1047, 1175, 1319)
+        for i, f in enumerate(pent):
+            S["collect%d" % i] = self.make(0.18, lambda b, f=f: (T(b, 0, 0.07, f, f, "sq", 0.3, 0.25),
+                                                                   T(b, 0.06, 0.12, f * 1.5, f * 1.5, "sq", 0.3, 0.25)))
+        S["ready"] = self.make(0.4, lambda b: [T(b, j * 0.09, 0.15, f, f, "tri", 0.5) for j, f in enumerate((523, 659, 784, 1047))])
+        S["hit"] = self.make(0.6, lambda b: (N(b, 0, 0.5, 0.9, 0.35, 0.05), T(b, 0, 0.5, 220, 50, "saw", 0.5)))
+        S["fall"] = self.make(1.2, lambda b: T(b, 0, 1.15, 900, 70, "tri", 0.55, vib=0.03))
+        S["blast"] = self.make(0.35, lambda b: (N(b, 0, 0.3, 0.8, 0.6, 0.1), T(b, 0, 0.25, 600, 120, "sq", 0.3, 0.5)))
+        S["aura"] = self.make(1.0, lambda b: (T(b, 0, 0.9, 160, 1300, "saw", 0.35, vib=0.02),
+                                              T(b, 0.1, 0.8, 320, 2000, "sin", 0.3), N(b, 0.5, 0.4, 0.3, 0.8, 0.8)))
+        S["start"] = self.make(0.6, lambda b: [T(b, j * 0.1, 0.25, f, f, "sq", 0.35, 0.25) for j, f in enumerate((392, 523, 659, 784))])
+        S["clear"] = self.make(0.9, lambda b: [T(b, j * 0.11, 0.3, f, f, "sq", 0.35, 0.25) for j, f in enumerate((523, 659, 784, 1047, 1319))])
+        S["gameover"] = self.make(1.6, lambda b: [T(b, j * 0.3, 0.45, f, f * 0.97, "tri", 0.55) for j, f in enumerate((392, 330, 262, 196))])
+        notes = (523, 659, 784, 1047, 784, 1047, 1319, 1568)
+
+        def fanfare(b):
+            for j, f in enumerate(notes):
+                T(b, j * 0.16, 0.4, f, f, "sq", 0.3, 0.25)
+                T(b, j * 0.16, 0.4, f / 2, f / 2, "tri", 0.4)
+            T(b, 1.3, 1.4, 1047, 1047, "sq", 0.3, 0.25)
+            T(b, 1.3, 1.4, 523, 523, "tri", 0.45)
+        S["victory"] = self.make(2.8, fanfare)
+        self.music = self.make_music()
+
+    def make_music(self):
+        """Eight bars of driving minor-key chiptune, A F C G (x2)."""
+        bpm = 152
+        beat = 60.0 / bpm
+        bars = 8
+        buf = [0.0] * int(bars * 4 * beat * self.rate)
+        T, N = self.tone, self.noise
+        roots = (110.0, 87.31, 130.81, 98.0)                 # A2 F2 C3 G2
+        chords = ((0, 3, 7), (0, 4, 7), (0, 4, 7), (0, 4, 7))
+        for bar in range(bars):
+            root = roots[bar % 4]
+            sem = chords[bar % 4]
+            if bar % 4 == 0:
+                sem = (0, 3, 7)
+            t0 = bar * 4 * beat
+            for i in range(8):                                # bass eighths
+                f = root * (2 if i % 4 == 3 else 1)
+                T(buf, t0 + i * beat / 2, beat * 0.45, f, f, "sq", 0.2, 0.5)
+            for i in range(16):                               # arpeggio
+                f = root * 4 * 2 ** (sem[(i * 2 + (i // 4)) % 3] / 12.0)
+                if i % 8 >= 6:
+                    f *= 2
+                T(buf, t0 + i * beat / 4, beat * 0.22, f, f, "sq", 0.1, 0.25)
+            for b in range(4):                                # drums
+                T(buf, t0 + b * beat, 0.12, 150, 45, "sin", 0.55)
+                N(buf, t0 + b * beat + beat / 2, 0.05, 0.22, 0.9)
+                if b % 2 == 1:
+                    N(buf, t0 + b * beat, 0.11, 0.3, 0.7)
+        return self.to_sound(buf, 0.8)
+
+    # -- playback -------------------------------------------------------
+    def play(self, name):
+        if self.ok and not self.muted:
+            snd = self.sfx.get(name)
+            if snd:
+                snd.play()
+
+    def start_music(self):
+        if self.ok and self.music and self.music_ch is None:
+            self.music.set_volume(0.0 if self.muted else 0.35)
+            self.music_ch = self.music.play(-1)
+
+    def stop_music(self, fade_ms=400):
+        if self.ok and self.music_ch is not None:
+            self.music_ch.fadeout(fade_ms)
+            self.music_ch = None
+
+    def pause(self, paused):
+        if self.ok:
+            (pygame.mixer.pause if paused else pygame.mixer.unpause)()
+
+    def toggle_mute(self):
+        self.muted = not self.muted
+        if self.ok and self.music:
+            self.music.set_volume(0.0 if self.muted else 0.35)
+
+
+# --------------------------------------------------------------------------
 # Game: window, input and rendering
 # --------------------------------------------------------------------------
 class Game:
     def __init__(self):
+        pygame.mixer.pre_init(Audio.RATE, -16, 1, 512)
         pygame.init()
         pygame.display.set_caption("LokiMan -- Burdened With Glorious Purpose")
-        self.screen = pygame.display.set_mode((W, H), pygame.SCALED | pygame.RESIZABLE)
+        try:
+            self.screen = pygame.display.set_mode((W, H), pygame.SCALED | pygame.RESIZABLE, vsync=1)
+        except pygame.error:
+            self.screen = pygame.display.set_mode((W, H), pygame.SCALED | pygame.RESIZABLE)
         self.world = pygame.Surface((W, H))
         self.clock = pygame.time.Clock()
         self.state = GameState()
+        self.audio = Audio()
         self.running = True
+        self._last_mode = None
 
     KEYS = {
         pygame.K_a: "left", pygame.K_LEFT: "left",
@@ -1335,6 +1578,8 @@ class Game:
             elif e.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
                 if st.mode in (st.TITLE, st.GAME_OVER, st.VICTORY):
                     st.start_game()
+            elif e.key == pygame.K_m:
+                self.audio.toggle_mute()
             elif e.key == pygame.K_p:
                 if st.mode == st.PLAYING:
                     st.mode = st.PAUSED
@@ -1346,12 +1591,37 @@ class Game:
                 else:
                     st.action(self.KEYS[e.key])
 
+    def step(self, dt):
+        """Fixed 120 Hz simulation steps keep physics and collisions frame-rate independent."""
+        self.accum = getattr(self, "accum", 0.0) + dt
+        while self.accum >= SIM_DT:
+            self.state.update(SIM_DT)
+            self.accum -= SIM_DT
+        self.sync_audio()
+
+    def sync_audio(self):
+        st, au = self.state, self.audio
+        for name in st.sfx_queue:
+            au.play(name)
+        st.sfx_queue.clear()
+        if st.mode != self._last_mode:
+            if st.mode == st.PLAYING:
+                if self._last_mode == st.PAUSED:
+                    au.pause(False)
+                else:
+                    au.start_music()
+            elif st.mode == st.PAUSED:
+                au.pause(True)
+            elif st.mode in (st.GAME_OVER, st.VICTORY):
+                au.stop_music()
+            self._last_mode = st.mode
+
     def run(self):
         while self.running:
-            dt = self.clock.tick(FPS) / 1000.0
+            dt = min(self.clock.tick(FPS) / 1000.0, 0.1)
             for e in pygame.event.get():
                 self.handle_event(e)
-            self.state.update(dt)
+            self.step(dt)
             self.draw()
             pygame.display.flip()
         pygame.quit()
@@ -1379,9 +1649,7 @@ class Game:
         for part in st.particles:
             part.draw(surf)
         if st.player.aura > 0:                                    # green screen tint
-            tint = pygame.Surface((W, H), pygame.SRCALPHA)
-            tint.fill((40, 255, 120, int(26 + 10 * math.sin(st.t * 12))))
-            surf.blit(tint, (0, 0))
+            fill_alpha(surf, (0, 0, W, H), (40, 255, 120), 26 + 10 * math.sin(st.t * 12))
 
     # -- HUD ----------------------------------------------------------------
     @staticmethod
@@ -1396,9 +1664,7 @@ class Game:
     def draw_hud(self, surf):
         st = self.state
         lvl = st.level
-        panel = pygame.Surface((400, 92), pygame.SRCALPHA)
-        panel.fill((0, 0, 0, 140))
-        surf.blit(panel, (10, 10))
+        fill_alpha(surf, (10, 10, 400, 92), BLACK, 140)
         draw_text(surf, f"LEVEL {lvl.num}/3", 26, GOLD, (20, 16), "topleft", ow=2)
         draw_text(surf, lvl.title, 18, WHITE, (20, 44), "topleft", ow=2)
         left = max(0, int(lvl.length - st.level_dist))
@@ -1408,9 +1674,7 @@ class Game:
         pygame.draw.rect(surf, GREEN, (20, 90, int(380 * frac), 8))
         pygame.draw.rect(surf, WHITE, (20, 90, 380, 8), 1)
 
-        panel2 = pygame.Surface((250, 92), pygame.SRCALPHA)
-        panel2.fill((0, 0, 0, 140))
-        surf.blit(panel2, (W - 260, 10))
+        fill_alpha(surf, (W - 260, 10, 250, 92), BLACK, 140)
         draw_text(surf, f"{int(st.score):07d}", 38, WHITE, (W - 20, 14), "topright")
         draw_cube(surf, W - 232, 78, 14, st.t * 3)
         draw_text(surf, f"x {st.tess}", 30, CYAN, (W - 205, 62), "topleft", ow=2)
@@ -1443,9 +1707,7 @@ class Game:
             return
         a = clamp(min(t, 3.6 - t) / 0.35, 0, 1)
         lvl = st.level
-        band = pygame.Surface((W, 120), pygame.SRCALPHA)
-        band.fill((0, 0, 0, int(160 * a)))
-        surf.blit(band, (0, 350))
+        fill_alpha(surf, (0, 350, W, 120), BLACK, 160 * a)
         for img_args in ((f"LEVEL {lvl.num}", 56, GOLD, 384), (lvl.title, 34, WHITE, 436), (f"~ {lvl.year} ~", 22, (150, 255, 180), 466)):
             img = text_surf(img_args[0], img_args[1], img_args[2], BLACK, 3)
             img = img.copy()
@@ -1454,9 +1716,7 @@ class Game:
 
     def draw_title(self, surf):
         st = self.state
-        dim = pygame.Surface((W, H), pygame.SRCALPHA)
-        dim.fill((0, 0, 0, 110))
-        surf.blit(dim, (0, 0))
+        fill_alpha(surf, (0, 0, W, H), BLACK, 110)
         bob = math.sin(st.t * 3) * 6
         img = text_surf("LOKIMAN", 150, GREEN, (10, 40, 20), 8)
         surf.blit(img, img.get_rect(center=(W // 2, 130 + bob)))
@@ -1473,9 +1733,7 @@ class Game:
 
     def draw_end(self, surf, victory):
         st = self.state
-        dim = pygame.Surface((W, H), pygame.SRCALPHA)
-        dim.fill((0, 0, 0, 170 if victory else 150))
-        surf.blit(dim, (0, 0))
+        fill_alpha(surf, (0, 0, W, H), BLACK, 170 if victory else 150)
         if victory:
             t = st.victory_t
             k = 1 + 0.04 * math.sin(t * 5)
@@ -1508,9 +1766,7 @@ class Game:
         self.screen.fill(BLACK)
         self.screen.blit(self.world, (ox, oy))
         if st.flash > 0:
-            fl = pygame.Surface((W, H), pygame.SRCALPHA)
-            fl.fill(st.flash_color + (int(160 * clamp(st.flash / 0.4, 0, 1)),))
-            self.screen.blit(fl, (0, 0))
+            fill_alpha(self.screen, (0, 0, W, H), st.flash_color, 160 * clamp(st.flash / 0.4, 0, 1))
         scr = self.screen
         if st.mode == st.TITLE:
             self.draw_title(scr)
@@ -1521,9 +1777,7 @@ class Game:
         if st.mode == st.PLAYING or st.mode == st.PAUSED:
             self.draw_level_card(scr)
         if st.mode == st.PAUSED:
-            dim = pygame.Surface((W, H), pygame.SRCALPHA)
-            dim.fill((0, 0, 0, 140))
-            scr.blit(dim, (0, 0))
+            fill_alpha(scr, (0, 0, W, H), BLACK, 140)
             draw_text(scr, "PAUSED", 100, GOLD, (W // 2, H // 2), ow=6)
         elif st.mode == st.GAME_OVER:
             self.draw_end(scr, False)
