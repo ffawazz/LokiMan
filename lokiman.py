@@ -12,6 +12,8 @@ Controls
                               (it also hurts bosses; Tesseracts damage them too)
     F11 or Cmd+F              toggle fullscreen
     M                         mute / unmute
+    (music: original synthesised soundtrack; drop your own title/level1/level2/level3/boss/victory
+     .ogg/.mp3/.wav files into a "music" folder next to this script to use them instead)
     Q                         cycle graphics quality (auto-lowers if slow)
     F3                        show FPS
     P                         pause          ENTER  start / restart     ESC  quit
@@ -30,6 +32,7 @@ import math
 import os
 import random
 import sys
+import threading
 
 import pygame
 
@@ -104,14 +107,13 @@ _fonts = {}
 
 
 def get_font(size):
+    """One clean, genuinely-bold sans-serif everywhere (no synthetic bolding, which smears letters)."""
     f = _fonts.get(size)
     if f is None:
-        names = ("impact,arialblack,dejavusansbold,arial" if size >= 44
-                 else "arialrounded,helveticaneue,arial,verdana,dejavusans")
         try:
-            f = pygame.font.SysFont(names, size, bold=True)
+            f = pygame.font.SysFont("helveticaneue,arial,helvetica,verdana,dejavusans,freesans", size, bold=True)
         except Exception:
-            f = pygame.font.Font(None, size)
+            f = pygame.font.Font(None, int(size * 1.1))
         _fonts[size] = f
     return f
 
@@ -120,6 +122,7 @@ _text_cache = {}
 
 
 def text_surf(txt, size, color, outline=BLACK, ow=3):
+    ow = min(ow, max(2, size // 14))          # thin outline: thick ones fill the letters in
     key = (txt, size, color, outline, ow)
     img = _text_cache.get(key)
     if img is None:
@@ -514,7 +517,7 @@ def build_levels():
                    side_b=(112, 112, 118), fog=(200, 120, 80), pit_rim=(255, 150, 40)),
               scenes=(('smash', 0.33), ('chase:hulk', 0.68))),
         Level(2, "THE TIME VARIANCE AUTHORITY", "1973-ish", 1800, "tva",
-              [("minute", 3), ("cabinet", 3), ("jetski", 3)],
+              [("minute", 3), ("cabinet", 3), ("jetski", 2)],
               dict(sky_top=(70, 35, 20), sky_bot=(235, 140, 50), ground=(90, 45, 20),
                    road_a=(204, 112, 42), road_b=(188, 100, 36), line=(250, 230, 170),
                    curb_a=(110, 60, 25), curb_b=(240, 200, 120), side_a=(124, 72, 36),
@@ -528,8 +531,9 @@ def build_levels():
                    side_b=(44, 26, 62), fog=(120, 50, 150), pit_rim=(200, 100, 255)),
               scenes=(('stampede', 0.28), ('stampede', 0.6))),
     ]
-    for lvl, boss in zip(levels, ('hulk', 'thor', 'alioth')):
-        lvl.boss = boss
+    # gentler obstacle spacing and fewer double-lane rows on level 2 than on level 3
+    for lvl, boss, gap, multi in zip(levels, ('hulk', 'thor', 'alioth'), (1.12, 1.0, 0.8), (0.35, 0.4, 0.58)):
+        lvl.boss, lvl.gap_mul, lvl.multi = boss, gap, multi
     return levels
 
 
@@ -1383,6 +1387,7 @@ class GameState:
     def begin_level(self):
         """Reset per-level state and schedule this level's goofy set pieces."""
         lvl = self.level
+        self.checkpoint = dict(score=self.score, tess_total=self.tess_total, apples=self.apples, tess=self.tess)
         self.level_dist = 0.0
         self.next_spawn = 55.0 if self.level_idx == 0 else 70.0
         self.obstacles = []
@@ -1403,6 +1408,24 @@ class GameState:
         self.chase_plans = [dict(who=sc["kind"].split(":")[1], start=sc["at"] * lvl.length,
                                  end=min(sc["at"] * lvl.length + CHASE_LEN, lvl.length - 70))
                             for sc in lvl.scenes if sc["kind"].startswith("chase")]
+
+    def retry_level(self):
+        """After a game over, restart the level you were on (not level 1) with fresh lives."""
+        cp = self.checkpoint
+        self.score, self.tess_total, self.apples, self.tess = cp["score"], cp["tess_total"], cp["apples"], cp["tess"]
+        self.lives = START_LIVES
+        self.meter = 0.0
+        self.meter_ready_said = False
+        self.speed_mult = 1.0
+        self.new_best = False
+        self.player.reset()
+        self.particles.clear()
+        self.banners.clear()
+        self.begin_level()
+        self.mode = self.PLAYING
+        self.sound("start")
+        self.flash, self.flash_color = 0.4, WHITE
+        self.add_banner("RETRY LEVEL %d: %s" % (self.level.num, self.level.title), GOLD, 3.0)
 
     def start_game(self):
         self.reset_run()
@@ -1510,7 +1533,7 @@ class GameState:
         # ---- PLAYING ----
         self.play_time += dt
         self.card_t = max(0.0, self.card_t - dt)
-        target = min(MAX_SPEED, BASE_SPEED + 0.16 * self.play_time + 1.5 * self.level_idx)
+        target = min(MAX_SPEED, BASE_SPEED + 0.16 * self.play_time + 3.0 * self.level_idx)
         if self.reverse:
             target = 13.0                   # obstacles rise from the bottom of the screen at a fair pace
         want = 0.5 if (p.tumble > 0 or p.fall > 0) else 1.0
@@ -1580,7 +1603,7 @@ class GameState:
                 continue
             if pos <= lvl.length - 30:
                 self.spawn_event(pos - self.level_dist, speed)
-            gap = speed * random.uniform(0.85, 1.25) * (1 - 0.07 * self.level_idx)
+            gap = speed * random.uniform(0.85, 1.25) * lvl.gap_mul
             self.next_spawn += max(20.0, gap * (0.8 if self.in_chase_window(pos) else 1.0))
 
     def spawn_scene(self, kind, start, speed):
@@ -1600,14 +1623,14 @@ class GameState:
             end = start + 22 * 7 + 30
             text, color, snd = "HULK SMASH!", (120, 255, 90), "roar"
         elif kind == "jetskis":
-            for i in range(6):
-                d = start + 17 * i + 8 - ld
-                vx = (1 if i % 2 else -1) * random.uniform(1.6, 2.1)
+            for i in range(5):
+                d = start + 20 * i + 8 - ld
+                vx = (1 if i % 2 else -1) * random.uniform(1.5, 1.9)
                 ln = random.choice(lanes)
                 self.obstacles.append(Obstacle("jetski", ln - 1 - vx * d / max(speed, 20), d, vx))
                 for j in range(3):
                     self.tesseracts.append(Tesseract(ln - 1, d + 4 + j * 2.2))
-            end = start + 17 * 6 + 30
+            end = start + 20 * 5 + 30
             text, color, snd = "MOBIUS' JET SKI RUSH!", (255, 170, 60), "roar"
         else:                                                         # stampede
             for i in range(5):
@@ -1642,7 +1665,7 @@ class GameState:
                     self.tesseracts.append(GoldenApple(ln - 1, dist + i * 2.8))
                 self.level_apples_spawned += 3
                 return
-        if self.level_idx == 1 and random.random() < 0.2:             # Thor throws Mjolnir across a lane
+        if self.level_idx == 1 and random.random() < 0.09:            # Thor throws Mjolnir across a lane
             self.obstacles.append(Obstacle.mjolnir(random.choice(lanes) - 1, dist))
             return
         if r < 0.50:                                                  # pit(s) in the road
@@ -1663,7 +1686,7 @@ class GameState:
             ln = random.choice((0, 2))
             self.obstacles.append(Obstacle("ship", ln - 1, dist))
             return
-        n = 1 if random.random() < 0.55 else 2
+        n = 2 if random.random() < self.level.multi else 1
         for ln in random.sample(lanes, n):
             k2 = random.choices(keys, weights)[0]
             if k2 in ("jetski", "ship"):
@@ -1867,7 +1890,7 @@ class GameState:
         pat = n % 3
 
         def row(i):
-            return d0 + i * 20 * sp
+            return d0 + i * (25 if kind == "thor" else 20) * sp
 
         def cubes(lane, d, count=2):
             for j in range(count):
@@ -1893,7 +1916,7 @@ class GameState:
                     for ln in others:
                         self.obstacles.append(Obstacle("shock", ln - 1, d))
                 else:                                               # Mjolnir barrage
-                    for ln in random.sample(others, 1 if pat == 0 else 2):
+                    for ln in random.sample(others, 1):
                         self.obstacles.append(Obstacle.mjolnir(ln - 1, d))
             else:                                                   # alioth (camera reversed)
                 if pat == 0:
@@ -2041,6 +2064,48 @@ class GameState:
         self.flash, self.flash_color = 0.6, GOLD
 
 
+MUSIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "music")
+_FOUR_ON_FLOOR = (0, 2, 4, 6, 8, 10, 12, 14)
+# Original, synthesised soundtrack. Put your own files in a "music" folder next to this script
+# (title / level1 / level2 / level3 / boss / victory, as .ogg .mp3 or .wav) and they play instead.
+TRACK_SPECS = {
+    "title": dict(bpm=116, bass="eighths", drums="half", lead_wave="sq", lead_vol=0.16, vib=0.0,
+                  arp=dict(steps=(0, 4, 8, 12), oct=1, len=3, wave="tri", vol=0.12),
+                  prog=[(57, (0, 3, 7)), (53, (0, 4, 7)), (60, (0, 4, 7)), (55, (0, 4, 7))] * 2,
+                  lead=[[(0, 12, 4), (4, 15, 2), (6, 19, 2), (8, 24, 8)], [(0, 12, 4), (4, 16, 2), (6, 19, 2), (8, 21, 8)],
+                        [(0, 12, 4), (4, 16, 2), (6, 19, 2), (8, 24, 6), (14, 19, 2)], [(0, 14, 4), (4, 19, 4), (8, 17, 4), (12, 14, 4)],
+                        [(0, 12, 2), (2, 15, 2), (4, 19, 4), (8, 24, 4), (12, 22, 4)], [(0, 21, 4), (4, 19, 4), (8, 16, 4), (12, 12, 4)],
+                        [(0, 12, 4), (4, 19, 4), (8, 24, 4), (12, 28, 4)], [(0, 26, 6), (6, 24, 2), (8, 19, 8)]]),
+    "level1": dict(bpm=128, bass="eighths", drums="four", lead_wave="sq", lead_vol=0.17, vib=0.0,
+                   arp=dict(steps=(0, 2, 4, 6, 8, 10, 12, 14), oct=2, len=1.6, wave="sq", vol=0.07, duty=0.25),
+                   prog=[(48, (0, 4, 7)), (43, (0, 4, 7)), (45, (0, 3, 7)), (41, (0, 4, 7)),
+                         (48, (0, 4, 7)), (43, (0, 4, 7)), (41, (0, 4, 7)), (43, (0, 4, 7))],
+                   lead=[[(0, 24, 3), (3, 19, 1), (4, 24, 4), (8, 28, 4), (12, 26, 4)], [(0, 26, 3), (3, 23, 1), (4, 26, 4), (8, 31, 4), (12, 29, 4)],
+                         [(0, 24, 3), (3, 21, 1), (4, 24, 4), (8, 28, 4), (12, 31, 4)], [(0, 29, 4), (4, 28, 4), (8, 24, 4), (12, 21, 4)],
+                         [(0, 28, 4), (4, 31, 4), (8, 36, 8)], [(0, 35, 4), (4, 31, 4), (8, 26, 8)],
+                         [(0, 33, 4), (4, 29, 4), (8, 24, 4), (12, 29, 4)], [(0, 31, 2), (2, 33, 2), (4, 35, 4), (8, 38, 8)]]),
+    "level2": dict(bpm=104, bass="funk", drums="funk", lead_wave="tri", lead_vol=0.2, vib=0.01,
+                   arp=dict(steps=(2, 6, 10, 14), oct=1, len=2.2, wave="sin", vol=0.14),
+                   prog=[(50, (0, 3, 7, 10)), (43, (0, 4, 7, 10)), (48, (0, 4, 7, 11)), (45, (0, 4, 7, 10))] * 2,
+                   lead=[[(0, 24, 3), (4, 22, 2), (6, 19, 2), (8, 17, 4), (12, 19, 2), (14, 22, 2)],
+                         [(0, 22, 3), (4, 19, 2), (6, 16, 2), (8, 14, 4), (12, 16, 4)],
+                         [(0, 23, 3), (4, 19, 2), (6, 16, 2), (8, 19, 4), (12, 24, 4)],
+                         [(0, 24, 3), (4, 28, 2), (6, 31, 2), (8, 34, 4), (12, 31, 4)]]),
+    "level3": dict(bpm=96, bass="drone", drums="half", lead_wave="sin", lead_vol=0.22, vib=0.012,
+                   arp=dict(steps=(0, 2, 4, 6, 8, 10, 12, 14), oct=1, len=2.4, wave="tri", vol=0.1),
+                   prog=[(45, (0, 3, 7)), (41, (0, 4, 7)), (40, (0, 4, 7)), (45, (0, 3, 7))] * 2,
+                   lead=[[(0, 24, 8), (8, 27, 4), (12, 26, 4)], [(0, 29, 8), (8, 28, 8)],
+                         [(0, 28, 8), (8, 31, 4), (12, 32, 4)], [(0, 31, 8), (8, 27, 8)]]),
+    "boss": dict(bpm=164, bass="sixteenths", drums="double", lead_wave="sq", lead_vol=0.17, vib=0.0,
+                 arp=dict(steps=(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15), oct=2, len=0.9, wave="sq", vol=0.05, duty=0.25),
+                 prog=[(40, (0, 3, 7)), (36, (0, 4, 7)), (38, (0, 4, 7)), (35, (0, 4, 7))] * 2,
+                 lead=[[(0, 24, 2), (2, 24, 2), (4, 27, 2), (6, 24, 2), (8, 31, 4), (12, 30, 4)],
+                       [(0, 24, 2), (2, 24, 2), (4, 28, 2), (6, 24, 2), (8, 31, 4), (12, 33, 4)],
+                       [(0, 26, 2), (2, 26, 2), (4, 29, 2), (6, 26, 2), (8, 33, 4), (12, 32, 4)],
+                       [(0, 23, 2), (2, 23, 2), (4, 27, 2), (6, 23, 2), (8, 30, 4), (12, 35, 4)]]),
+}
+
+
 # --------------------------------------------------------------------------
 # Audio: every sound is synthesised at start-up (no asset files needed)
 # --------------------------------------------------------------------------
@@ -2051,8 +2116,12 @@ class Audio:
         self.ok = False
         self.muted = False
         self.sfx = {}
-        self.music = None
-        self.music_ch = None
+        self.track = None
+        self.track_snd = None
+        self.track_ch = None
+        self.user_playing = False
+        self.ducked = False
+        self._track_bytes = {}
         try:
             if not pygame.mixer.get_init():
                 pygame.mixer.init(self.RATE, -16, 1, 512)
@@ -2075,7 +2144,7 @@ class Audio:
             return 2 * ph - 1
         return math.sin(ph * math.tau)
 
-    def tone(self, buf, start, dur, f0, f1=None, kind="sq", vol=0.5, duty=0.5, attack=0.004, vib=0.0):
+    def tone(self, buf, start, dur, f0, f1=None, kind="sq", vol=0.5, duty=0.5, attack=0.004, vib=0.0, hold=False):
         """Mix a note (optionally gliding f0 -> f1) into buf starting at `start` seconds."""
         r = self.rate
         f1 = f0 if f1 is None else f1
@@ -2090,7 +2159,7 @@ class Audio:
             if vib:
                 f *= 1 + vib * math.sin(i / r * 40)
             ph += f / r
-            env = min(1.0, i / max(1, attack * r)) * (1 - t) ** 1.5
+            env = min(1.0, i / max(1, attack * r)) * ((1 - t) ** 0.4 if hold else (1 - t) ** 1.5)
             buf[i0 + i] += self.wave(kind, ph, duty) * vol * env
 
     def noise(self, buf, start, dur, vol=0.5, lp=0.5, lp_end=None):
@@ -2160,37 +2229,81 @@ class Audio:
             T(b, 1.3, 1.4, 1047, 1047, "sq", 0.3, 0.25)
             T(b, 1.3, 1.4, 523, 523, "tri", 0.45)
         S["victory"] = self.make(2.8, fanfare)
-        self.music = self.make_music()
+        threading.Thread(target=self._build_tracks, daemon=True).start()     # compose the soundtrack in the background
 
-    def make_music(self):
-        """Eight bars of driving minor-key chiptune, A F C G (x2)."""
-        bpm = 152
-        beat = 60.0 / bpm
-        bars = 8
-        buf = [0.0] * int(bars * 4 * beat * self.rate)
-        T, N = self.tone, self.noise
-        roots = (110.0, 87.31, 130.81, 98.0)                 # A2 F2 C3 G2
-        chords = ((0, 3, 7), (0, 4, 7), (0, 4, 7), (0, 4, 7))
-        for bar in range(bars):
-            root = roots[bar % 4]
-            sem = chords[bar % 4]
-            if bar % 4 == 0:
-                sem = (0, 3, 7)
+    # -- soundtrack -----------------------------------------------------
+    @staticmethod
+    def hz(m):
+        return 440.0 * 2 ** ((m - 69) / 12.0)
+
+    def render_track(self, spec):
+        """Render one looping, original soundtrack as a float buffer (called on a worker thread)."""
+        beat = 60.0 / spec["bpm"]
+        step = beat / 4
+        prog = spec["prog"]
+        buf = [0.0] * int(len(prog) * 4 * beat * self.rate)
+        T, N, hz = self.tone, self.noise, self.hz
+        arp = spec["arp"]
+        for bar, (root, chord) in enumerate(prog):
             t0 = bar * 4 * beat
-            for i in range(8):                                # bass eighths
-                f = root * (2 if i % 4 == 3 else 1)
-                T(buf, t0 + i * beat / 2, beat * 0.45, f, f, "sq", 0.2, 0.5)
-            for i in range(16):                               # arpeggio
-                f = root * 4 * 2 ** (sem[(i * 2 + (i // 4)) % 3] / 12.0)
-                if i % 8 >= 6:
-                    f *= 2
-                T(buf, t0 + i * beat / 4, beat * 0.22, f, f, "sq", 0.1, 0.25)
-            for b in range(4):                                # drums
-                T(buf, t0 + b * beat, 0.12, 150, 45, "sin", 0.55)
-                N(buf, t0 + b * beat + beat / 2, 0.05, 0.22, 0.9)
-                if b % 2 == 1:
-                    N(buf, t0 + b * beat, 0.11, 0.3, 0.7)
-        return self.to_sound(buf, 0.8)
+            bass = spec["bass"]
+            if bass == "eighths":
+                for i in range(8):
+                    m = root + (12 if i % 4 == 3 else 0)
+                    T(buf, t0 + i * beat / 2, beat * 0.45, hz(m), hz(m), "sq", 0.2, 0.5)
+            elif bass == "funk":
+                for st in (0, 3, 6, 8, 10, 14):
+                    m = root + (12 if st in (6, 14) else 0)
+                    T(buf, t0 + st * step, step * 1.7, hz(m), hz(m), "saw", 0.2)
+            elif bass == "drone":
+                T(buf, t0, 4 * beat, hz(root - 12), hz(root - 12), "saw", 0.2, hold=True)
+                T(buf, t0, 4 * beat, hz(root - 5), hz(root - 5), "tri", 0.14, hold=True)
+            else:                                                             # sixteenths
+                for i in range(16):
+                    m = root + (12 if i % 8 == 7 else 0)
+                    T(buf, t0 + i * step, step * 0.8, hz(m), hz(m), "sq", 0.15, 0.5)
+            for j, st in enumerate(arp["steps"]):                            # arpeggio / keys
+                m = root + 12 * arp["oct"] + chord[j % len(chord)]
+                T(buf, t0 + st * step, step * arp["len"], hz(m), hz(m), arp["wave"], arp["vol"], arp.get("duty", 0.5))
+            for st, semi, ln in spec["lead"][bar % len(spec["lead"])]:        # melody
+                m = root + semi
+                T(buf, t0 + st * step, ln * step * 0.92, hz(m), hz(m), spec["lead_wave"], spec["lead_vol"], 0.25,
+                  vib=spec.get("vib", 0.0), hold=True)
+            d = spec["drums"]
+            kicks = {"four": (0, 4, 8, 12), "half": (0, 8), "funk": (0, 6, 10), "double": (0, 2, 4, 6, 8, 10, 12, 14)}[d]
+            snares = {"four": (4, 12), "half": (12,), "funk": (4, 12), "double": (4, 12)}[d]
+            hats = {"four": (2, 6, 10, 14), "half": (4, 12), "funk": tuple(range(0, 16, 2)), "double": tuple(range(0, 16))}[d]
+            for k_ in kicks:
+                T(buf, t0 + k_ * step, 0.13, 150, 45, "sin", 0.55)
+            for sn in snares:
+                N(buf, t0 + sn * step, 0.11, 0.3, 0.7)
+            for h in hats:
+                sw = step * 0.18 if (d == "funk" and (h // 2) % 2) else 0
+                N(buf, t0 + h * step + sw, 0.03, 0.1, 0.95)
+        peak = max(1e-6, max(abs(v) for v in buf))
+        k = 0.85 / peak if peak > 0.85 else 1.0
+        from array import array
+        data = array("h")
+        for v in buf:
+            v = int(clamp(v * k, -1.0, 1.0) * 30000)
+            data.append(v)
+            if self.channels == 2:
+                data.append(v)
+        return data.tobytes()
+
+    def _build_tracks(self):
+        for name, spec in TRACK_SPECS.items():
+            try:
+                self._track_bytes[name] = self.render_track(spec)
+            except Exception:
+                self._track_bytes[name] = None
+
+    def _find_user_file(self, name):
+        for ext in (".ogg", ".mp3", ".wav"):
+            path = os.path.join(MUSIC_DIR, name + ext)
+            if os.path.exists(path):
+                return path
+        return None
 
     # -- playback -------------------------------------------------------
     def play(self, name):
@@ -2199,29 +2312,81 @@ class Audio:
             if snd:
                 snd.play()
 
-    def start_music(self):
-        if self.ok and self.music and self.music_ch is None:
-            self.music.set_volume(0.0 if self.muted else 0.35)
-            self.music_ch = self.music.play(-1)
+    def _volume(self):
+        if self.muted:
+            return 0.0
+        base = 0.55 if self.user_playing else 0.33
+        return base * (0.3 if self.ducked else 1.0)
 
-    def stop_music(self, fade_ms=400):
-        if self.ok and self.music_ch is not None:
-            self.music_ch.fadeout(fade_ms)
-            self.music_ch = None
+    def _apply_volume(self):
+        if not self.ok:
+            return
+        v = self._volume()
+        if self.user_playing:
+            pygame.mixer.music.set_volume(v)
+        elif self.track_snd is not None:
+            self.track_snd.set_volume(v)
+
+    def _stop_current(self, fade=500):
+        if self.user_playing:
+            pygame.mixer.music.fadeout(fade)
+        elif self.track_ch is not None:
+            self.track_ch.fadeout(fade)
+        self.user_playing = False
+        self.track_ch = None
+        self.track_snd = None
+
+    def set_track(self, name):
+        """Switch the background music; returns False while the track is still being composed."""
+        if not self.ok:
+            return True
+        if name == self.track:
+            return True
+        if name is None:
+            self._stop_current()
+            self.track = None
+            return True
+        path = self._find_user_file(name)                 # your own audio file always wins
+        if path is None and name in TRACK_SPECS:
+            if name not in self._track_bytes:
+                return False                              # still being composed in the background
+            if self._track_bytes[name] is None:           # composing failed: stay silent
+                self._stop_current()
+                self.track = name
+                return True
+        self._stop_current()
+        self.track = name
+        if path is not None:
+            try:
+                pygame.mixer.music.load(path)
+                self.user_playing = True
+                self._apply_volume()
+                pygame.mixer.music.play(-1)
+            except pygame.error:
+                self.user_playing = False
+        elif name in TRACK_SPECS:
+            self.track_snd = pygame.mixer.Sound(buffer=self._track_bytes[name])
+            self._apply_volume()
+            self.track_ch = self.track_snd.play(-1)
+        return True
 
     def duck(self, on):
         """Quieten the music (level-break screen)."""
-        if self.ok and self.music and not self.muted:
-            self.music.set_volume(0.12 if on else 0.35)
+        self.ducked = on
+        self._apply_volume()
 
     def pause(self, paused):
         if self.ok:
-            (pygame.mixer.pause if paused else pygame.mixer.unpause)()
+            if paused:
+                pygame.mixer.pause()
+                pygame.mixer.music.pause()
+            else:
+                pygame.mixer.unpause()
+                pygame.mixer.music.unpause()
 
     def toggle_mute(self):
         self.muted = not self.muted
-        if self.ok and self.music:
-            self.music.set_volume(0.0 if self.muted else 0.35)
+        self._apply_volume()
 
 
 # --------------------------------------------------------------------------
@@ -2419,10 +2584,14 @@ class Game:
                 self.set_quality((self.quality + 1) % 3)
                 st.add_banner("GRAPHICS: " + ("FULL", "FAST", "FASTEST")[self.quality], WHITE, 1.2)
             elif e.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
-                if st.mode in (st.TITLE, st.GAME_OVER, st.VICTORY):
+                if st.mode == st.GAME_OVER:
+                    st.retry_level()
+                elif st.mode in (st.TITLE, st.VICTORY):
                     st.start_game()
                 elif st.mode == st.LEVEL_BREAK:
                     st.break_continue()
+            elif e.key == pygame.K_n and st.mode in (st.GAME_OVER, st.VICTORY):
+                st.start_game()
             elif e.key == pygame.K_m:
                 self.audio.toggle_mute()
             elif e.key == pygame.K_p:
@@ -2431,7 +2600,9 @@ class Game:
                 elif st.mode == st.PAUSED:
                     st.mode = st.PLAYING
             elif e.key in self.KEYS:
-                if st.mode in (st.TITLE, st.GAME_OVER, st.VICTORY) and e.key == pygame.K_SPACE:
+                if st.mode == st.GAME_OVER and e.key == pygame.K_SPACE:
+                    st.retry_level()
+                elif st.mode in (st.TITLE, st.VICTORY) and e.key == pygame.K_SPACE:
                     st.start_game()
                 elif st.mode == st.LEVEL_BREAK and e.key == pygame.K_SPACE:
                     st.break_continue()
@@ -2461,21 +2632,20 @@ class Game:
             au.play(name)
         st.sfx_queue.clear()
         if st.mode != self._last_mode:
-            if st.mode == st.PLAYING:
-                if self._last_mode == st.PAUSED:
-                    au.pause(False)
-                elif self._last_mode == st.LEVEL_BREAK:
-                    au.duck(False)
-                else:
-                    au.start_music()
-            elif st.mode == st.PAUSED:
-                au.pause(True)
-            elif st.mode == st.LEVEL_BREAK:
-                au.duck(True)
-            elif st.mode in (st.GAME_OVER, st.VICTORY):
-                au.duck(False)
-                au.stop_music()
+            au.pause(st.mode == st.PAUSED)
+            au.duck(st.mode == st.LEVEL_BREAK)
             self._last_mode = st.mode
+        if st.mode == st.TITLE:
+            want = "title"
+        elif st.mode in (st.PLAYING, st.PAUSED):
+            want = "boss" if (st.boss is not None and not st.boss["dead"]) else "level%d" % (st.level_idx + 1)
+        elif st.mode == st.LEVEL_BREAK:
+            want = au.track
+        elif st.mode == st.VICTORY:
+            want = "victory"
+        else:
+            want = None
+        au.set_track(want)
 
     def run(self):
         while self.running:
@@ -2642,7 +2812,7 @@ class Game:
         surf.blit(img, img.get_rect(center=(W // 2, 120 + bob)))
         draw_text(surf, "BURDENED WITH GLORIOUS PURPOSE", 34, (170, 255, 190), (W // 2, 214), ow=3)
         fill_alpha(surf, (W // 2 - 400, 250, 800, 220), (8, 10, 24), 200)
-        draw_text(surf, "COLLECT TESSERACTS.  JUMP FOR GOLDEN APPLES.  OUTRUN THE MULTIVERSE.", 22, CYAN, (W // 2, 272), ow=2)
+        draw_text(surf, "COLLECT TESSERACTS.  JUMP FOR APPLES.  BEAT THE BOSSES.", 22, CYAN, (W // 2, 272), ow=2)
         lines = ["A / D   or   LEFT / RIGHT   -   SHIFT LANES",
                  "W / UP / SPACE   -   JUMP LOW BARRIERS",
                  "S / DOWN   -   SLIDE UNDER HIGH HAZARDS",
@@ -2760,7 +2930,8 @@ class Game:
             draw_text(surf, f"REACHED LEVEL {st.level.num}   -   {int(st.total_dist)} m   -   {st.tess_total} TESSERACTS   -   {st.apples} APPLES",
                       22, CYAN, (W // 2, 420), ow=3)
             if int(st.t * 2.5) % 2 == 0:
-                draw_text(surf, "PRESS ENTER TO TRY AGAIN", 38, GOLD, (W // 2, 500), ow=4)
+                draw_text(surf, "ENTER: RETRY LEVEL %d" % st.level.num, 40, GOLD, (W // 2, 500), ow=4)
+            draw_text(surf, "N: NEW GAME FROM LEVEL 1", 24, (200, 205, 220), (W // 2, 552), ow=3)
 
     def draw(self):
         st = self.state
@@ -2782,7 +2953,8 @@ class Game:
         else:
             if st.mode != st.VICTORY:
                 self.draw_hud(scr)
-            self.draw_banners(scr)
+            if st.mode in (st.PLAYING, st.PAUSED):
+                self.draw_banners(scr)
             if st.mode == st.PAUSED:
                 fill_alpha(scr, (0, 0, W, H), BLACK, 150)
                 draw_text(scr, "PAUSED", 110, GOLD, (W // 2, H // 2), ow=6)
