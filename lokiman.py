@@ -11,6 +11,8 @@ Controls
     F                         unleash GLORIOUS PURPOSE (when the meter is full)
     F11 or Cmd+F              toggle fullscreen
     M                         mute / unmute
+    Q                         cycle graphics quality (auto-lowers if slow)
+    F3                        show FPS
     P                         pause          ENTER  start / restart     ESC  quit
 
 Architecture
@@ -22,7 +24,9 @@ Architecture
     GameState    rules: spawning, collisions, scoring, progression
     Game         pygame window, input, drawing of world / HUD / overlays
 """
+import gc
 import math
+import os
 import random
 import sys
 
@@ -33,6 +37,7 @@ import pygame
 # --------------------------------------------------------------------------
 W, H = 960, 640
 FPS = 60
+FPS_CAP = 120
 SIM_DT = 1 / 120.0
 HORIZON = 230            # screen y of the vanishing line
 PLAYER_Y = 560           # screen y of Loki's feet (scale == 1)
@@ -55,6 +60,10 @@ INVULN_TIME = 2.2
 AURA_TIME = 6.0
 METER_GAIN = 7.0
 START_LIVES = 3
+MAX_LIVES = 5
+APPLES_PER_LIFE = 10
+CHASE_LEN = 320.0
+BEST_FILE = "lokiman_best.txt"
 
 GOLD = (245, 200, 40)
 GREEN = (40, 170, 80)
@@ -84,14 +93,18 @@ def hrand(a, b=0, salt=0):
     return v - math.floor(v)
 
 
+FX = {"glow": True, "tint": True, "decor": 1}   # lowered automatically on slow machines
+
 _fonts = {}
 
 
 def get_font(size):
     f = _fonts.get(size)
     if f is None:
+        names = ("impact,arialblack,dejavusansbold,arial" if size >= 44
+                 else "arialrounded,helveticaneue,arial,verdana,dejavusans")
         try:
-            f = pygame.font.SysFont("impact,arialblack,dejavusansbold,arial", size, bold=True)
+            f = pygame.font.SysFont(names, size, bold=True)
         except Exception:
             f = pygame.font.Font(None, size)
         _fonts[size] = f
@@ -150,7 +163,7 @@ _glow_cache = {}
 
 
 def glow_surf(radius, color, strength=170):
-    radius = max(2, int(radius) // 2 * 2)
+    radius = max(4, int(radius) // 8 * 8 + 8)
     key = (radius, color, strength)
     g = _glow_cache.get(key)
     if g is None:
@@ -163,6 +176,8 @@ def glow_surf(radius, color, strength=170):
 
 
 def blit_glow(surf, cx, cy, radius, color, strength=170):
+    if not FX["glow"]:
+        return
     g = glow_surf(radius, color, strength)
     surf.blit(g, g.get_rect(center=(int(cx), int(cy))))
 
@@ -281,7 +296,8 @@ class LaneManager:
 class Level:
     DECOR_SPACING = 10.0
 
-    def __init__(self, num, title, year, length, theme, obstacles, pal):
+    def __init__(self, num, title, year, length, theme, obstacles, pal, scenes=()):
+        self.scenes = [dict(kind=k, at=a) for k, a in scenes]
         self.num, self.title, self.year, self.length = num, title, year, length
         self.theme, self.obstacles, self.pal = theme, obstacles, pal
         self._bd = None
@@ -379,6 +395,8 @@ class Level:
         k0 = int(travel // sp)
         fn = getattr(self, "_decor_" + self.theme)
         for k in range(k0 + int(FAR / sp) + 1, k0 - 1, -1):
+            if FX["decor"] > 1 and k % 2:
+                continue
             dist = k * sp - travel
             if dist < -3 or dist > FAR:
                 continue
@@ -471,19 +489,22 @@ def build_levels():
               dict(sky_top=(30, 45, 75), sky_bot=(225, 130, 70), ground=(40, 40, 45),
                    road_a=(66, 66, 74), road_b=(58, 58, 66), line=(240, 200, 40),
                    curb_a=(205, 60, 50), curb_b=(235, 235, 235), side_a=(124, 124, 130),
-                   side_b=(112, 112, 118), fog=(200, 120, 80), pit_rim=(255, 150, 40))),
+                   side_b=(112, 112, 118), fog=(200, 120, 80), pit_rim=(255, 150, 40)),
+              scenes=(('smash', 0.33), ('chase:hulk', 0.68))),
         Level(2, "THE TIME VARIANCE AUTHORITY", "1973-ish", 1800, "tva",
               [("minute", 3), ("cabinet", 3), ("jetski", 3)],
               dict(sky_top=(70, 35, 20), sky_bot=(235, 140, 50), ground=(90, 45, 20),
                    road_a=(204, 112, 42), road_b=(188, 100, 36), line=(250, 230, 170),
                    curb_a=(110, 60, 25), curb_b=(240, 200, 120), side_a=(124, 72, 36),
-                   side_b=(108, 62, 30), fog=(230, 150, 70), pit_rim=(255, 230, 120))),
+                   side_b=(108, 62, 30), fog=(230, 150, 70), pit_rim=(255, 230, 120)),
+              scenes=(('jetskis', 0.33), ('chase:clock', 0.68))),
         Level(3, "THE VOID AT THE END OF TIME", "THE END", 2100, "void",
               [("gator", 3), ("ship", 2), ("smoke", 3)],
               dict(sky_top=(25, 10, 45), sky_bot=(150, 60, 170), ground=(30, 15, 45),
                    road_a=(74, 44, 106), road_b=(64, 36, 94), line=(190, 120, 255),
                    curb_a=(130, 60, 200), curb_b=(60, 200, 140), side_a=(52, 30, 72),
-                   side_b=(44, 26, 62), fog=(120, 50, 150), pit_rim=(200, 100, 255))),
+                   side_b=(44, 26, 62), fog=(120, 50, 150), pit_rim=(200, 100, 255)),
+              scenes=(('stampede', 0.33), ('chase:alioth', 0.68))),
     ]
 
 
@@ -491,6 +512,8 @@ def build_levels():
 # Tesseract
 # --------------------------------------------------------------------------
 class Tesseract:
+    high = False                 # high collectibles can only be grabbed while jumping
+
     def __init__(self, lane_x, dist):
         self.lane_x, self.dist, self.prev_dist = lane_x, dist, dist
         self.t = random.random() * 6
@@ -518,6 +541,31 @@ class Tesseract:
             pygame.draw.line(surf, WHITE, (c[0], c[1] - r), (c[0], c[1] + r), 1)
 
 
+def draw_apple(surf, cx, cy, r, t=0.0):
+    """One of Idunn's golden apples."""
+    blit_glow(surf, cx, cy, r * 2.4, (255, 210, 60), 140)
+    pygame.draw.circle(surf, (205, 140, 20), (int(cx), int(cy + r * 0.08)), max(2, int(r)))
+    pygame.draw.circle(surf, (255, 205, 45), (int(cx - r * 0.06), int(cy - r * 0.06)), max(2, int(r * 0.9)))
+    pygame.draw.ellipse(surf, (255, 250, 190), (cx - r * 0.55, cy - r * 0.62, r * 0.45 + 1, r * 0.3 + 1))
+    pygame.draw.line(surf, (110, 70, 20), (cx, cy - r * 0.8), (cx + r * 0.1, cy - r * 1.3), max(1, int(r * 0.14)))
+    pygame.draw.ellipse(surf, (60, 190, 80), (cx + r * 0.1, cy - r * 1.35, r * 0.7 + 1, r * 0.35 + 1))
+    if math.sin(t * 6) > 0.7:
+        pygame.draw.line(surf, WHITE, (cx + r * 0.9 - 4, cy - r * 0.5), (cx + r * 0.9 + 4, cy - r * 0.5), 2)
+        pygame.draw.line(surf, WHITE, (cx + r * 0.9, cy - r * 0.5 - 4), (cx + r * 0.9, cy - r * 0.5 + 4), 2)
+
+
+class GoldenApple(Tesseract):
+    """Floats high above the road: jump to grab it."""
+    high = True
+
+    def draw(self, surf, lm):
+        if self.dist > FAR:
+            return
+        sx, sy, s = lm.project(self.lane_x, self.dist)
+        pellipse(surf, (0, 0, 0), (sx, sy), s, -16, -5, 32, 10)
+        draw_apple(surf, sx, sy - (132 + math.sin(self.t * 4) * 8) * s, 19 * s, self.t)
+
+
 # --------------------------------------------------------------------------
 # Obstacle
 # --------------------------------------------------------------------------
@@ -533,6 +581,7 @@ SPECS = {
     "gator":   dict(kind="low",   width=0.9, depth=1.8, clear=54),
     "ship":    dict(kind="heavy", width=1.4, depth=2.8, clear=0),
     "smoke":   dict(kind="high",  width=1.0, depth=1.6, clear=0),
+    "fist":    dict(kind="heavy", width=0.95, depth=2.2, clear=0),
     "pit":     dict(kind="pit",   width=0.9, depth=5.0, clear=26),
 }
 
@@ -548,6 +597,7 @@ class Obstacle:
         self.blasted = False
         self.bt = 0.0
         self.bdir = 1
+        self.landed = False
 
     def update(self, dt, speed):
         self.prev_dist = self.dist
@@ -609,6 +659,28 @@ class Obstacle:
             a[1] -= 520 * self.bt * s
         pellipse(surf, (0, 0, 0), (sx, sy), s, -self.width * 55, -7, self.width * 110, 14)   # shadow
         getattr(self, "_draw_" + self.key)(surf, a, s, self.t)
+
+    def _draw_fist(self, surf, a, s, t):
+        lift = max(0.0, self.dist - 11) * 38
+        if lift > 0:                                                  # flashing warning shadow
+            warn = clamp(1 - (self.dist - 11) / 45, 0.15, 1)
+            col = (255, 80, 60) if int(t * 10) % 2 else (120, 255, 90)
+            pellipse(surf, col, a, s, -70 * warn, -14 * warn, 140 * warn, 28 * warn, 5)
+        b = (a[0], a[1] - lift * s)
+        prect(surf, (70, 150, 55), b, s, -34, -1500, 68, 1380)           # the arm, from off-screen
+        prect(surf, (50, 120, 40), b, s, 12, -1500, 22, 1380)
+        ppoly(surf, (110, 60, 150), b, s, [(-44, -150), (44, -150), (52, -118), (36, -126), (20, -116), (0, -126), (-20, -116), (-36, -126), (-52, -118)])
+        prect(surf, (90, 185, 70), b, s, -62, -120, 124, 104)
+        prect(surf, (60, 140, 50), b, s, -62, -36, 124, 20)
+        for i in range(4):                                             # knuckles
+            pcirc(surf, (110, 205, 90), b, s, -46 + i * 31, -14, 17)
+            pcirc(surf, (70, 150, 55), b, s, -46 + i * 31, -14, 17 * 0.4)
+        pline(surf, (50, 110, 40), b, s, -62, -78, 62, -78, 3)
+        if lift == 0:                                                  # impact cracks and dust
+            for dx, dy in ((-70, -6), (60, -10), (-30, -2), (34, 0)):
+                pline(surf, (20, 20, 20), a, s, dx, dy, dx * 2.1, dy - 14, 3)
+            for j in range(4):
+                pcirc(surf, (170, 170, 160), a, s, -60 + j * 40, -20 - (t * 60 + j * 20) % 40, 12)
 
     def _draw_taxi(self, surf, a, s, t):
         prect(surf, (20, 20, 22), a, s, -58, -18, 26, 20)
@@ -728,21 +800,34 @@ class Obstacle:
         pcirc(surf, BLACK, a, s, 56, -111, 2)
         blit_glow(surf, a[0], a[1] - 40 * s, 70 * s + 4, (170, 80, 255), 90)
 
+    _smoke_frames = {}
+
+    @classmethod
+    def _smoke_frame(cls, i):
+        img = cls._smoke_frames.get(i)
+        if img is None:
+            w, h = 240, 190
+            img = pygame.Surface((w, h), pygame.SRCALPHA)
+            c = (w // 2, h // 2)
+            t = i * 0.35
+            for j in range(9):
+                ang = j * 0.7 + t * 1.3
+                r = 34 + 10 * math.sin(t * 3 + j)
+                px = c[0] + math.cos(ang) * 62 * (0.5 + 0.5 * hrand(j, 3))
+                py = c[1] + math.sin(ang) * 40 * (0.5 + 0.5 * hrand(j, 4))
+                pygame.draw.circle(img, (110 + j * 8, 40, 160, 170), (int(px), int(py)), int(r))
+            pygame.draw.circle(img, (30, 6, 50, 220), c, 34)
+            for ex in (-12, 12):
+                pygame.draw.ellipse(img, (255, 240, 255, 255), (c[0] + ex - 5, c[1] - 5, 11, 7))
+            cls._smoke_frames[i] = img
+        return img
+
     def _draw_smoke(self, surf, a, s, t):
         pellipse(surf, (40, 10, 60), a, s, -60, -12, 120, 16)
+        img = self._smoke_frame(int(t * 10) % 18)
         w, h = max(8, int(240 * s)), max(8, int(190 * s))
-        tmp = pygame.Surface((w, h), pygame.SRCALPHA)
-        c = (w // 2, h // 2)
-        for j in range(9):
-            ang = j * 0.7 + t * 1.3
-            r = (34 + 10 * math.sin(t * 3 + j)) * s
-            px = c[0] + math.cos(ang) * 62 * s * (0.5 + 0.5 * hrand(j, 3))
-            py = c[1] + math.sin(ang) * 40 * s * (0.5 + 0.5 * hrand(j, 4))
-            pygame.draw.circle(tmp, (110 + j * 8, 40, 160, 170), (int(px), int(py)), max(2, int(r)))
-        pygame.draw.circle(tmp, (30, 6, 50, 220), c, max(2, int(34 * s)))
-        for ex in (-12, 12):
-            pygame.draw.ellipse(tmp, (255, 240, 255, 255), (c[0] + ex * s - 5 * s, c[1] - 5 * s, 10 * s + 2, 6 * s + 1))
-        surf.blit(tmp, (a[0] - w / 2, a[1] - 130 * s - h / 2))
+        img = pygame.transform.scale(img, (w, h))
+        surf.blit(img, (a[0] - w / 2, a[1] - 130 * s - h / 2))
 
 
 # --------------------------------------------------------------------------
@@ -827,6 +912,7 @@ class Player:
         self.ghosts = []
         self.ghost_t = 0.0
         self.time = 0.0
+        self.front = False        # True: Loki faces the camera (chase scenes)
 
     # -- state ----------------------------------------------------------
     @property
@@ -926,6 +1012,8 @@ class Player:
     # -- drawing --------------------------------------------------------
     def _render(self, pose, frame):
         """Back view of Loki (cape, helmet horns), feet at bottom centre."""
+        if self.front:
+            return self._render_front(pose, frame)
         surf = pygame.Surface((130, 190), pygame.SRCALPHA)
         fx, fy = 65, 186
         ph = frame / 12.0 * math.pi * 2
@@ -970,11 +1058,61 @@ class Player:
         pygame.draw.polygon(surf, GOLD, [(fx - 5, fy - 126), (fx + 5, fy - 126), (fx, fy - 146)])
         return surf
 
+    def _render_front(self, pose, frame):
+        """Front view: a terrified, screaming Loki running towards the camera."""
+        surf = pygame.Surface((130, 190), pygame.SRCALPHA)
+        fx, fy = 65, 186
+        ph = frame / 12.0 * math.pi * 2
+        if pose == "run":
+            legs_up = (max(0, math.sin(ph)) * 14, max(0, -math.sin(ph)) * 14)
+        elif pose == "jump":
+            legs_up = (16, 6)
+        else:
+            legs_up = (0, 0)
+        swing = math.sin(ph) * 12 if pose == "run" else 0
+        pygame.draw.polygon(surf, (14, 88, 44), [(fx - 32, fy - 100), (fx + 32, fy - 100), (fx + 44, fy - 24), (fx - 44, fy - 24)])
+        for i, lift in enumerate(legs_up):
+            lx = fx - 22 + i * 20
+            pygame.draw.rect(surf, DKGREEN, (lx, fy - 38 - lift, 16, 30))
+            pygame.draw.rect(surf, (25, 25, 25), (lx - 1, fy - 12 - lift, 18, 12))
+            pygame.draw.rect(surf, GOLD, (lx - 1, fy - 18 - lift, 18, 4))
+        pygame.draw.rect(surf, GREEN, (fx - 24, fy - 100, 48, 66))
+        pygame.draw.polygon(surf, GOLD, [(fx - 20, fy - 98), (fx - 7, fy - 98), (fx, fy - 76), (fx + 7, fy - 98), (fx + 20, fy - 98), (fx, fy - 52)])
+        pygame.draw.rect(surf, GOLD, (fx - 24, fy - 44, 48, 6))
+        pygame.draw.circle(surf, (60, 230, 120), (fx, fy - 41), 4)
+        for sgn in (-1, 1):                                            # arms flail
+            if pose == "jump":
+                ay, ah = fy - 128, 40
+            else:
+                ay, ah = fy - 98 + swing * sgn, 38
+            pygame.draw.rect(surf, GREEN, (fx + sgn * 34 - 6, ay, 12, ah))
+            pygame.draw.rect(surf, GOLD, (fx + sgn * 34 - 7, ay + ah - 10, 14, 6))
+            pygame.draw.rect(surf, (225, 190, 150), (fx + sgn * 34 - 5, ay - 6 if pose == "jump" else ay + ah - 4, 10, 8))
+        pygame.draw.rect(surf, (225, 190, 150), (fx - 14, fy - 128, 28, 30))      # face
+        pygame.draw.rect(surf, (30, 28, 34), (fx - 15, fy - 132, 30, 9))
+        pygame.draw.rect(surf, (30, 28, 34), (fx - 15, fy - 126, 4, 18))
+        pygame.draw.rect(surf, (30, 28, 34), (fx + 11, fy - 126, 4, 18))
+        for ex in (-9, 2):                                              # huge panicked eyes
+            pygame.draw.rect(surf, WHITE, (fx + ex, fy - 119, 8, 10))
+            pygame.draw.rect(surf, (20, 150, 70), (fx + ex + 2, fy - 116, 4, 5))
+        pygame.draw.line(surf, (30, 28, 34), (fx - 11, fy - 123), (fx - 3, fy - 121), 2)
+        pygame.draw.line(surf, (30, 28, 34), (fx + 11, fy - 123), (fx + 3, fy - 121), 2)
+        pygame.draw.ellipse(surf, (90, 20, 30), (fx - 5, fy - 107, 10, 10))      # screaming mouth
+        pygame.draw.ellipse(surf, (230, 90, 100), (fx - 3, fy - 102, 6, 4))
+        pygame.draw.rect(surf, GOLD, (fx - 17, fy - 130, 34, 8))
+        for sgn in (-1, 1):
+            pygame.draw.polygon(surf, GOLD, [(fx + sgn * 12, fy - 126), (fx + sgn * 44, fy - 188),
+                                             (fx + sgn * 33, fy - 190), (fx + sgn * 5, fy - 134)])
+            pygame.draw.polygon(surf, (200, 150, 20), [(fx + sgn * 12, fy - 126), (fx + sgn * 44, fy - 188),
+                                                       (fx + sgn * 40, fy - 180), (fx + sgn * 14, fy - 130)])
+        pygame.draw.polygon(surf, GOLD, [(fx - 5, fy - 132), (fx + 5, fy - 132), (fx, fy - 150)])
+        return surf
+
     def sprite(self, pose, frame):
-        key = (pose, frame if pose == "run" else 0)
+        key = (self.front, pose, frame if pose == "run" else 0)
         img = self._sprites.get(key)
         if img is None:
-            base = self._render("run" if pose == "slide" else pose, key[1])
+            base = self._render("run" if pose == "slide" else pose, key[2])
             k = self.SPRITE_K
             if pose == "slide":
                 base = pygame.transform.rotozoom(pygame.transform.smoothscale(base, (int(130 * 1.35), int(190 * 0.55))), 10, 1.0)
@@ -985,7 +1123,7 @@ class Player:
         return img
 
     def ghost_img(self, pose, frame):
-        key = (pose, frame if pose == "run" else 0)
+        key = (self.front, pose, frame if pose == "run" else 0)
         g = self._ghosts_img.get(key)
         if g is None:
             g = pygame.mask.from_surface(self.sprite(pose, frame)).to_surface(
@@ -1043,8 +1181,42 @@ class Player:
 # --------------------------------------------------------------------------
 # GameState: rules and progression
 # --------------------------------------------------------------------------
+def _best_path():
+    return os.path.join(os.path.expanduser("~"), "." + BEST_FILE)
+
+
+def load_best():
+    try:
+        with open(_best_path()) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def save_best(v):
+    try:
+        with open(_best_path(), "w") as f:
+            f.write(str(int(v)))
+    except OSError:
+        pass
+
+
+CHASE_INFO = {
+    "hulk":   ("HULK WANTS A WORD! RUN!", (120, 255, 90), "THE HULK GOT BORED. PUNY HULK!"),
+    "clock":  ("MISS MINUTES SAYS: TIME'S UP!", (255, 170, 60), "TIME WAITS FOR NO ONE... EXCEPT LOKI!"),
+    "alioth": ("ALIOTH IS HUNGRY! RUN!", (205, 130, 255), "ALIOTH CHOKED ON YOUR AWESOMENESS!"),
+}
+BREAK_QUIPS = (
+    ("I AM LOKI OF ASGARD... AND I AM LATE!", "NEW YORK? I'VE SEEN WORSE. BARELY."),
+    ("I'M ON A VERY TIGHT SCHEDULE. LITERALLY.", "MOBIUS, I WILL HAVE THAT JET SKI."),
+    ("THE VOID? MY FAVOURITE HOLIDAY SPOT!", "KNEEL. OR AT LEAST SIT DOWN."),
+)
+TESS_QUIPS = ("TESSERACT TAX COLLECTED!", "SHINY! MINE!", "THE MULTIVERSE OWES ME!", "IS THIS... GLORIOUS PURPOSE?")
+BREAK_ROW_T = 1.0
+
+
 class GameState:
-    TITLE, PLAYING, PAUSED, GAME_OVER, VICTORY = range(5)
+    TITLE, PLAYING, PAUSED, GAME_OVER, VICTORY, LEVEL_BREAK = range(6)
     LOW_HIT_QUIPS = ("NOT THE FACE!", "I MEANT TO DO THAT!", "A TRICK, OF COURSE!")
 
     def __init__(self):
@@ -1060,6 +1232,9 @@ class GameState:
         self.flash = 0.0
         self.flash_color = WHITE
         self.sfx_queue = []
+        self.best = load_best()
+        self.new_best = False
+        self.brk = None
         self.reset_run()
 
     @property
@@ -1070,22 +1245,43 @@ class GameState:
         self.lives = START_LIVES
         self.score = 0.0
         self.tess = 0
+        self.tess_total = 0
+        self.apples = 0
         self.meter = 0.0
         self.level_idx = 0
-        self.level_dist = 0.0
         self.total_dist = 0.0
         self.play_time = 0.0
         self.speed = BASE_SPEED
         self.speed_mult = 1.0
-        self.obstacles = []
-        self.tesseracts = []
-        self.next_spawn = 55.0
         self.card_t = 0.0
         self.meter_ready_said = False
         self.victory_t = 0.0
+        self.new_best = False
+        self.brk = None
         self.player.reset()
         self.particles.clear()
         self.banners.clear()
+        self.begin_level()
+
+    def begin_level(self):
+        """Reset per-level state and schedule this level's goofy set pieces."""
+        lvl = self.level
+        self.level_dist = 0.0
+        self.next_spawn = 55.0 if self.level_idx == 0 else 70.0
+        self.obstacles = []
+        self.tesseracts = []
+        self.level_tess = self.level_apples = self.level_apples_spawned = 0
+        self.level_hits = 0
+        self.scene_points = 0
+        self.chase = None
+        self.player.front = False
+        self.announce = []
+        self.scene_watch = []
+        self.pending_scenes = [dict(kind=sc["kind"], at_dist=sc["at"] * lvl.length)
+                               for sc in lvl.scenes if not sc["kind"].startswith("chase")]
+        self.chase_plans = [dict(who=sc["kind"].split(":")[1], start=sc["at"] * lvl.length,
+                                 end=min(sc["at"] * lvl.length + CHASE_LEN, lvl.length - 70))
+                            for sc in lvl.scenes if sc["kind"].startswith("chase")]
 
     def start_game(self):
         self.reset_run()
@@ -1172,6 +1368,9 @@ class GameState:
             return
         if self.mode == self.PAUSED:
             return
+        if self.mode == self.LEVEL_BREAK:
+            self.update_break(dt)
+            return
         if self.mode == self.GAME_OVER:
             self.speed_mult += (0 - self.speed_mult) * min(1, 2 * dt)
             self.travel += self.speed * self.speed_mult * dt
@@ -1193,7 +1392,7 @@ class GameState:
         target = min(MAX_SPEED, BASE_SPEED + 0.16 * self.play_time + 1.5 * self.level_idx)
         want = 0.5 if (p.tumble > 0 or p.fall > 0) else 1.0
         self.speed_mult += (want - self.speed_mult) * min(1, 4 * dt)
-        self.speed = target * self.speed_mult * (1.12 if p.aura > 0 else 1.0)
+        self.speed = target * self.speed_mult * (1.12 if p.aura > 0 else 1.0) * (1.1 if self.chase else 1.0)
         step = self.speed * dt
         self.travel += step
         self.level_dist += step
@@ -1205,6 +1404,12 @@ class GameState:
             o.update(dt, self.speed)
         for c in self.tesseracts:
             c.update(dt, self.speed)
+        for o in self.obstacles:
+            if o.key == "fist" and not o.landed and o.dist <= 11:
+                o.landed = True
+                self.shake = max(self.shake, 0.25)
+                self.sound("slam")
+        self.update_scenes(dt)
         self.collisions()
         self.obstacles = [o for o in self.obstacles if not o.dead]
         self.tesseracts = [c for c in self.tesseracts if not c.dead]
@@ -1229,25 +1434,82 @@ class GameState:
                 return True
         return False
 
+    def in_chase_window(self, pos):
+        return any(c["start"] <= pos < c["end"] for c in self.chase_plans)
+
     def spawn(self, speed):
         lvl = self.level
         while self.level_dist + SPAWN_D >= self.next_spawn:
             pos = self.next_spawn
+            if self.pending_scenes and pos >= self.pending_scenes[0]["at_dist"]:
+                sc = self.pending_scenes.pop(0)
+                self.spawn_scene(sc["kind"], pos, speed)
+                continue
             if pos <= lvl.length - 30:
                 self.spawn_event(pos - self.level_dist, speed)
-            self.next_spawn += max(20.0, speed * random.uniform(0.85, 1.25) * (1 - 0.07 * self.level_idx))
+            gap = speed * random.uniform(0.85, 1.25) * (1 - 0.07 * self.level_idx)
+            self.next_spawn += max(20.0, gap * (0.8 if self.in_chase_window(pos) else 1.0))
+
+    def spawn_scene(self, kind, start, speed):
+        """Scripted, goofy set pieces: Hulk fists, jet ski rush, gator stampede."""
+        ld = self.level_dist
+        lanes = [0, 1, 2]
+        if kind == "smash":
+            safe = 1
+            for i in range(7):
+                d = start + 22 * i + 10 - ld
+                safe = int(clamp(safe + random.choice((-1, 0, 1)), 0, 2))
+                others = [ln for ln in lanes if ln != safe]
+                for ln in (others if random.random() < 0.55 else [random.choice(others)]):
+                    self.obstacles.append(Obstacle("fist", ln - 1, d))
+                for j in range(3):
+                    self.tesseracts.append(Tesseract(safe - 1, d - 8 + j * 2.4))
+            end = start + 22 * 7 + 30
+            text, color, snd = "HULK SMASH!", (120, 255, 90), "roar"
+        elif kind == "jetskis":
+            for i in range(6):
+                d = start + 17 * i + 8 - ld
+                vx = (1 if i % 2 else -1) * random.uniform(1.6, 2.1)
+                ln = random.choice(lanes)
+                self.obstacles.append(Obstacle("jetski", ln - 1 - vx * d / max(speed, 20), d, vx))
+                for j in range(3):
+                    self.tesseracts.append(Tesseract(ln - 1, d + 4 + j * 2.2))
+            end = start + 17 * 6 + 30
+            text, color, snd = "MOBIUS' JET SKI RUSH!", (255, 170, 60), "roar"
+        else:                                                         # stampede
+            for i in range(5):
+                d = start + 30 * i + 10 - ld
+                for ln in lanes:
+                    self.obstacles.append(Obstacle("gator", ln - 1, d + random.uniform(0, 1.6)))
+                if i in (1, 3):
+                    ln = random.choice(lanes)
+                    for j in range(3):
+                        self.tesseracts.append(GoldenApple(ln - 1, d + 14 + j * 2.6))
+                    self.level_apples_spawned += 3
+            end = start + 30 * 5 + 30
+            text, color, snd = "ALLIGATOR LOKI STAMPEDE!", (90, 255, 140), "roar"
+        self.announce.append(dict(at=start - 2, text=text, color=color, snd=snd, end=end))
+        self.next_spawn = end + 10
 
     def spawn_event(self, dist, speed):
         r = random.random()
         lanes = [0, 1, 2]
-        if r < 0.28:                                                  # a line of Tesseracts
+        if r < 0.26:                                                  # a line of Tesseracts
             free = [ln for ln in lanes if not self.lane_blocked(ln, dist - 6, dist + 16)]
             if free:
                 ln = random.choice(free)
                 for i in range(6):
                     self.tesseracts.append(Tesseract(ln - 1, dist + i * 2.6))
             return
-        if r < 0.42:                                                  # pit(s) in the road
+        if r < 0.36 and self.level_apples_spawned < 12:               # golden apples: jump for them!
+            free = [ln for ln in lanes if not self.lane_blocked(ln, dist - 6, dist + 10)]
+            if free:
+                ln = random.choice(free)
+                for i in range(3):
+                    self.tesseracts.append(GoldenApple(ln - 1, dist + i * 2.8))
+                self.level_apples_spawned += 3
+                return
+        if r < 0.50:                                                  # pit(s) in the road
             n = 1 if random.random() < 0.6 else 2
             start = random.randint(0, 3 - n)
             for ln in range(start, start + n):
@@ -1285,10 +1547,20 @@ class GameState:
             if c.collected or p.fall > 0:
                 continue
             if c.dist <= 0.9 and c.prev_dist >= -0.9 and abs(p.x - c.lane_x) < 0.55:
+                if c.high:
+                    if p.jump_h < 30 and p.aura <= 0:
+                        continue
+                    c.collected = True
+                    self.collect_apple(c)
+                    continue
                 c.collected = True
                 self.tess += 1
+                self.tess_total += 1
+                self.level_tess += 1
                 self.score += 50
                 self.sound("collect%d" % (self.tess % 5))
+                if self.tess_total % 25 == 0:
+                    self.add_banner(random.choice(TESS_QUIPS), (120, 220, 255), 1.6)
                 if p.aura <= 0:
                     self.meter = min(100.0, self.meter + METER_GAIN)
                     if self.meter >= 100 and not self.meter_ready_said:
@@ -1316,9 +1588,23 @@ class GameState:
             self.hurt(o)
             break
 
+    def collect_apple(self, c):
+        self.apples += 1
+        self.level_apples += 1
+        self.score += 200
+        self.sound("apple")
+        sx = self.lm.px(c.lane_x)
+        self.particles.append(Particle(sx, PLAYER_Y - 200, 0, -80, 0.9, GOLD, kind="text", text="+200"))
+        self.burst(sx, PLAYER_Y - 150, GOLD, 12, 240, 5, 300)
+        if self.apples % APPLES_PER_LIFE == 0 and self.lives < MAX_LIVES:
+            self.lives += 1
+            self.sound("oneup")
+            self.add_banner("ONE-UP! GOLDEN APPLE POWER!", GOLD, 2.2)
+
     def hurt(self, o):
         p = self.player
         self.lives -= 1
+        self.level_hits += 1
         self.shake = 0.5
         if o.kind == "pit":
             o.hit = True
@@ -1337,6 +1623,7 @@ class GameState:
                 self.add_banner(random.choice(self.LOW_HIT_QUIPS), (255, 200, 60), 2.0)
             lost = min(self.tess, 10)
             self.tess -= lost
+            self.level_tess = max(0, self.level_tess - lost)
             self.meter = max(0.0, self.meter - 25)
             self.meter_ready_said = self.meter >= 100
             sx, sy = self.lm.px(p.x), PLAYER_Y - 90
@@ -1346,29 +1633,145 @@ class GameState:
                 self.particles.append(Particle(sx, sy, math.cos(a) * v, math.sin(a) * v, random.uniform(1.0, 1.6),
                                                CYAN, 11, 900, "cube"))
             self.burst(sx, sy, GOLD, 14)
+        if self.chase is not None:
+            self.chase["gap"] -= 0.34
+            if self.chase["gap"] <= 0.05:                             # the chaser catches Loki!
+                self.chase["gap"] = 0.6
+                grab = min(self.tess, 10)
+                self.tess -= grab
+                self.level_tess = max(0, self.level_tess - grab)
+                self.add_banner("CAUGHT! GIVE ME THOSE CUBES!", (255, 120, 90), 2.0)
+                self.sound("roar")
         if self.lives <= 0:
+            self.update_best()
             self.mode = self.GAME_OVER
             self.sound("gameover")
             self.add_banner("THE TRICKSTER HAS FALLEN...", (255, 120, 120), 3.5)
 
-    def finish_level(self):
+    def update_scenes(self, dt):
+        ld = self.level_dist
+        for a in list(self.announce):
+            if ld >= a["at"]:
+                self.announce.remove(a)
+                self.add_banner(a["text"], a["color"], 2.4)
+                self.sound(a["snd"])
+                self.shake = max(self.shake, 0.3)
+                self.scene_watch.append(dict(end=a["end"] - 25, hits=self.level_hits))
+        for w in list(self.scene_watch):
+            if ld >= w["end"]:
+                self.scene_watch.remove(w)
+                if self.level_hits == w["hits"]:
+                    self.score += 500
+                    self.scene_points += 500
+                    self.sound("oneup")
+                    self.add_banner("FLAWLESS! +500", GOLD, 1.8)
+        plan = next((c for c in self.chase_plans if c["start"] <= ld < c["end"]), None)
+        if plan and self.chase is None:
+            self.chase = dict(who=plan["who"], gap=1.0)
+            self.player.front = True
+            text, color, _ = CHASE_INFO[plan["who"]]
+            self.add_banner(text, color, 2.8)
+            self.sound("roar")
+            self.shake = 0.5
+        elif self.chase is not None and plan is None:
+            self.end_chase()
+        if self.chase is not None:
+            self.chase["gap"] = min(1.0, self.chase["gap"] + 0.06 * dt)
+
+    def end_chase(self):
+        who = self.chase["who"]
+        self.chase = None
+        self.player.front = False
         self.score += 1000
-        if self.level_idx >= len(self.levels) - 1:
-            self.score += self.lives * 500 + self.tess * 10
-            self.mode = self.VICTORY
-            self.sound("victory")
-            self.banners.clear()
-            self.flash, self.flash_color = 0.6, GOLD
-            return
-        self.level_idx += 1
+        self.scene_points += 1000
         self.sound("clear")
-        self.level_dist = 0.0
-        self.next_spawn = 70.0
+        self.shake = 0.4
+        self.flash, self.flash_color = 0.3, GOLD
+        self.add_banner(CHASE_INFO[who][2], GOLD, 2.6)
+        self.add_banner("ESCAPED! +1000", (150, 255, 170), 2.2)
+
+    def update_best(self):
+        if self.score > self.best:
+            self.best = int(self.score)
+            self.new_best = True
+            save_best(self.best)
+
+    def finish_level(self):
+        """Level over: show the tally screen (with a goofy Loki) before moving on."""
+        if self.chase is not None:
+            self.end_chase()
         self.obstacles.clear()
         self.tesseracts.clear()
-        self.card_t = 3.6
+        hits = self.level_hits
+        rows = [
+            ("TESSERACTS", str(self.level_tess), self.level_tess * 20, "cube"),
+            ("GOLDEN APPLES", "%d / %d" % (self.level_apples, self.level_apples_spawned), self.level_apples * 150, "apple"),
+            ("NO-HIT RUN", "PERFECT!" if hits == 0 else "%d HIT%s" % (hits, "" if hits == 1 else "S"), 1000 if hits == 0 else 0, "helmet"),
+            ("LEVEL CLEARED", "", 1000, "flag"),
+        ]
+        total = sum(r[2] for r in rows)
+        self.brk = dict(rows=rows, t=0.0, total=total, score0=self.score, done=False, row=-1, tick=-1,
+                        quip=random.choice(BREAK_QUIPS[self.level_idx]))
+        self.score += total
+        self.mode = self.LEVEL_BREAK
+        self.sound("clear")
         self.flash, self.flash_color = 0.5, WHITE
-        self.add_banner("LEVEL CLEAR! +1000", GOLD, 2.0)
+        self.banners.clear()
+
+    def update_break(self, dt):
+        b = self.brk
+        b["t"] += dt
+        n = len(b["rows"])
+        idx = min(n, int(b["t"] / BREAK_ROW_T))
+        if idx != b["row"]:
+            if idx > 0:
+                self.sound("ding")
+            b["row"] = idx
+        if idx < n and b["rows"][idx][2] > 0:
+            prog = clamp((b["t"] % BREAK_ROW_T) / 0.8, 0, 1)
+            ticks = int(prog * 16)
+            if ticks != b["tick"] and prog < 1:
+                self.sound("tick")
+            b["tick"] = ticks
+        if not b["done"] and b["t"] >= n * BREAK_ROW_T + 0.6:
+            b["done"] = True
+            self.sound("oneup")
+        if random.random() < 0.5:
+            self.particles.append(Particle(random.uniform(0, W), -12, random.uniform(-30, 30), random.uniform(120, 260),
+                                           4, CYAN, 9, 200, "cube"))
+        self.travel += 4 * dt
+        self.player.update(dt, 0)
+
+    def break_continue(self):
+        b = self.brk
+        if b is None:
+            return
+        n = len(b["rows"])
+        if not b["done"]:
+            b["t"] = n * BREAK_ROW_T + 0.6
+            b["done"] = True
+            b["row"] = n
+            self.sound("ding")
+            return
+        if self.level_idx >= len(self.levels) - 1:
+            self.victory()
+            return
+        self.level_idx += 1
+        self.begin_level()
+        self.mode = self.PLAYING
+        self.card_t = 3.6
+        self.flash, self.flash_color = 0.4, WHITE
+        self.sound("start")
+        self.particles.clear()
+
+    def victory(self):
+        self.score += self.lives * 500
+        self.update_best()
+        self.mode = self.VICTORY
+        self.sound("victory")
+        self.banners.clear()
+        self.particles.clear()
+        self.flash, self.flash_color = 0.6, GOLD
 
 
 # --------------------------------------------------------------------------
@@ -1462,6 +1865,12 @@ class Audio:
         for i, f in enumerate(pent):
             S["collect%d" % i] = self.make(0.18, lambda b, f=f: (T(b, 0, 0.07, f, f, "sq", 0.3, 0.25),
                                                                    T(b, 0.06, 0.12, f * 1.5, f * 1.5, "sq", 0.3, 0.25)))
+        S["slam"] = self.make(0.5, lambda b: (N(b, 0, 0.45, 1.0, 0.18, 0.03), T(b, 0, 0.4, 110, 38, "sin", 0.8)))
+        S["apple"] = self.make(0.4, lambda b: [T(b, j * 0.06, 0.2, f, f, "sq", 0.28, 0.25) for j, f in enumerate((1047, 1319, 1568, 2093))])
+        S["oneup"] = self.make(0.6, lambda b: [T(b, j * 0.07, 0.15, f, f, "sq", 0.3, 0.5) for j, f in enumerate((659, 784, 1319, 1047, 1175, 1568))])
+        S["tick"] = self.make(0.05, lambda b: T(b, 0, 0.04, 1400, 1400, "sq", 0.25, 0.25))
+        S["ding"] = self.make(0.35, lambda b: (T(b, 0, 0.3, 1568, 1568, "sin", 0.5), T(b, 0, 0.3, 2093, 2093, "sin", 0.25)))
+        S["roar"] = self.make(0.9, lambda b: (N(b, 0, 0.8, 0.7, 0.12, 0.05), T(b, 0, 0.8, 95, 60, "saw", 0.45, vib=0.05)))
         S["ready"] = self.make(0.4, lambda b: [T(b, j * 0.09, 0.15, f, f, "tri", 0.5) for j, f in enumerate((523, 659, 784, 1047))])
         S["hit"] = self.make(0.6, lambda b: (N(b, 0, 0.5, 0.9, 0.35, 0.05), T(b, 0, 0.5, 220, 50, "saw", 0.5)))
         S["fall"] = self.make(1.2, lambda b: T(b, 0, 1.15, 900, 70, "tri", 0.55, vib=0.03))
@@ -1529,6 +1938,11 @@ class Audio:
             self.music_ch.fadeout(fade_ms)
             self.music_ch = None
 
+    def duck(self, on):
+        """Quieten the music (level-break screen)."""
+        if self.ok and self.music and not self.muted:
+            self.music.set_volume(0.12 if on else 0.35)
+
     def pause(self, paused):
         if self.ok:
             (pygame.mixer.pause if paused else pygame.mixer.unpause)()
@@ -1537,6 +1951,95 @@ class Audio:
         self.muted = not self.muted
         if self.ok and self.music:
             self.music.set_volume(0.0 if self.muted else 0.35)
+
+
+# --------------------------------------------------------------------------
+# Chasers for the front-facing "RUN!" scenes
+# --------------------------------------------------------------------------
+def draw_pursuer(surf, who, ax, ay, k, t):
+    a = (ax, ay)
+    if who == "hulk":
+        pellipse(surf, (60, 125, 48), a, k, -215, -210, 430, 270)
+        for sgn in (-1, 1):
+            sw = math.sin(t * 7 + sgn) * 28
+            pcirc(surf, (60, 125, 48), a, k, sgn * 240, -150 + sw, 70)
+            pcirc(surf, (95, 185, 70), a, k, sgn * 240, -154 + sw, 62)
+            for j in range(3):
+                pcirc(surf, (70, 140, 55), a, k, sgn * 240 + (j - 1) * 28, -120 + sw, 16)
+        pellipse(surf, (110, 60, 150), a, k, -150, -40, 300, 100)                      # torn purple pants
+        pellipse(surf, (95, 185, 70), a, k, -105, -395, 210, 230)
+        ppoly(surf, (36, 28, 46), a, k, [(-105, -310), (-92, -400), (-45, -428), (0, -414), (50, -430), (95, -398), (105, -310),
+                                        (62, -365), (0, -352), (-62, -365)])
+        mouth = 26 + 22 * abs(math.sin(t * 6))
+        pellipse(surf, (110, 20, 30), a, k, -62, -272, 124, mouth * 1.6)
+        for j in range(6):
+            prect(surf, WHITE, a, k, -56 + j * 19, -270, 15, 14)
+        for sgn in (-1, 1):
+            pellipse(surf, WHITE, a, k, sgn * 40 - 24, -332, 48, 30)
+            pcirc(surf, (20, 90, 20), a, k, sgn * 40 - sgn * 4, -316, 8)
+            pline(surf, (36, 28, 46), a, k, sgn * 82, -352, sgn * 8, -326, 15)
+        pcirc(surf, (60, 125, 48), a, k, -14, -290, 6)
+        pcirc(surf, (60, 125, 48), a, k, 14, -290, 6)
+    elif who == "clock":
+        spin = t * 3
+        pcirc(surf, (200, 95, 20), a, k, 0, -210, 200)
+        pcirc(surf, (255, 150, 30), a, k, 0, -210, 190)
+        for sgn in (-1, 1):
+            pcirc(surf, (255, 150, 30), a, k, sgn * 105, -395, 44)
+            pcirc(surf, (200, 95, 20), a, k, sgn * 105, -395, 20)
+        pcirc(surf, (255, 240, 205), a, k, 0, -210, 148)
+        for i in range(12):
+            ang = spin + i * math.pi / 6
+            pline(surf, (120, 60, 20), a, k, math.sin(ang) * 120, -210 - math.cos(ang) * 120,
+                  math.sin(ang) * 142, -210 - math.cos(ang) * 142, 8)
+        for sgn in (-1, 1):                                                           # googly eyes
+            pellipse(surf, WHITE, a, k, sgn * 44 - 28, -285, 56, 76)
+            pellipse(surf, (60, 40, 20), a, k, sgn * 44 - 28, -285, 56, 76, 4)
+            pcirc(surf, BLACK, a, k, sgn * 44 + math.sin(t * 5) * 8, -240, 15)
+            pcirc(surf, (255, 150, 150), a, k, sgn * 92, -190, 20)
+        pts = [(i * 7, -150 + (i * 7) ** 2 / 240) for i in range(-12, 13)]
+        for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+            pline(surf, (100, 20, 20), a, k, x0, y0, x1, y1, 8)
+        ang = t * 1.5
+        pline(surf, (80, 40, 15), a, k, 0, -210, math.sin(ang) * 80, -210 - math.cos(ang) * 80, 12)
+        for sgn in (-1, 1):                                                           # little running legs
+            pline(surf, (80, 40, 15), a, k, sgn * 50, -20, sgn * 50 + math.sin(t * 12 + sgn) * 30, 20, 14)
+            pellipse(surf, BLACK, a, k, sgn * 50 + math.sin(t * 12 + sgn) * 30 - 24, 8, 54, 26)
+    else:                                                                             # alioth
+        for i in range(16):
+            ang = i * 0.9 + t * 0.8
+            r = 90 + 60 * hrand(i, 7)
+            px = math.cos(ang) * (120 + 60 * hrand(i, 9))
+            py = -210 + math.sin(ang * 1.3) * (90 + 30 * hrand(i, 11))
+            pcirc(surf, (55 + i * 4, 20, 90 + i * 5), a, k, px, py, r)
+        for sgn in (-1, 1):
+            for j in range(4):
+                pcirc(surf, (45 + j * 10, 14, 70 + j * 8), a, k, sgn * (150 + j * 38), -40 + j * 22 + math.sin(t * 4 + j) * 14, 54 - j * 8)
+        pcirc(surf, (22, 6, 36), a, k, 0, -205, 150)
+        mouth = 60 + 24 * abs(math.sin(t * 5))
+        pellipse(surf, (90, 10, 40), a, k, -105, -195, 210, mouth)
+        for j in range(9):
+            x = -96 + j * 24
+            ppoly(surf, WHITE, a, k, [(x, -190), (x + 20, -190), (x + 10, -150)])
+            ppoly(surf, WHITE, a, k, [(x, -195 + mouth), (x + 20, -195 + mouth), (x + 10, -235 + mouth)])
+        for sgn in (-1, 1):
+            blit_glow(surf, ax + sgn * 76 * k, ay - 290 * k, 70 * k, (255, 230, 255), 160)
+            ppoly(surf, (255, 245, 255), a, k, [(sgn * 30, -300), (sgn * 120, -330), (sgn * 128, -296), (sgn * 40, -276)])
+            pcirc(surf, (190, 60, 220), a, k, sgn * 84, -306, 10)
+
+
+def wrap_text(txt, size, maxw):
+    words, lines, cur = txt.split(), [], ""
+    f = get_font(size)
+    for w_ in words:
+        trial = (cur + " " + w_).strip()
+        if f.size(trial)[0] <= maxw:
+            cur = trial
+        else:
+            lines.append(cur)
+            cur = w_
+    lines.append(cur)
+    return lines
 
 
 # --------------------------------------------------------------------------
@@ -1557,6 +2060,38 @@ class Game:
         self.audio = Audio()
         self.running = True
         self._last_mode = None
+        self.accum = 0.0
+        self.quality = 0            # 0 full, 1 no glows, 2 lean; drops automatically if the game runs slowly
+        self.ema = 1 / 60
+        self.slow_t = 0.0
+        self.show_fps = False
+        self.warmup()
+        gc.collect()
+        gc.freeze()
+        gc.set_threshold(50000, 20, 20)       # fewer garbage-collector hitches
+
+    def warmup(self):
+        """Build the expensive caches up front so nothing hitches mid-run."""
+        for lvl in self.state.levels:
+            lvl.backdrop()
+        for v in range(6):
+            Level._facade(self.state.levels[0], v, 120, 200)
+        p = self.state.player
+        for front in (False, True):
+            p.front = front
+            for pose in ("run", "jump", "slide"):
+                for fr in range(12 if pose == "run" else 1):
+                    p.sprite(pose, fr)
+                    p.ghost_img(pose, fr)
+        p.front = False
+        for i in range(18):
+            Obstacle._smoke_frame(i)
+
+    def set_quality(self, q):
+        self.quality = q
+        FX["glow"] = q == 0
+        FX["tint"] = q == 0
+        FX["decor"] = 2 if q >= 2 else 1
 
     KEYS = {
         pygame.K_a: "left", pygame.K_LEFT: "left",
@@ -1575,9 +2110,16 @@ class Game:
                 self.running = False
             elif e.key == pygame.K_F11 or (e.key == pygame.K_f and e.mod & (pygame.KMOD_META | pygame.KMOD_CTRL)):
                 pygame.display.toggle_fullscreen()
+            elif e.key == pygame.K_F3:
+                self.show_fps = not self.show_fps
+            elif e.key == pygame.K_q:
+                self.set_quality((self.quality + 1) % 3)
+                st.add_banner("GRAPHICS: " + ("FULL", "FAST", "FASTEST")[self.quality], WHITE, 1.2)
             elif e.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
                 if st.mode in (st.TITLE, st.GAME_OVER, st.VICTORY):
                     st.start_game()
+                elif st.mode == st.LEVEL_BREAK:
+                    st.break_continue()
             elif e.key == pygame.K_m:
                 self.audio.toggle_mute()
             elif e.key == pygame.K_p:
@@ -1588,16 +2130,27 @@ class Game:
             elif e.key in self.KEYS:
                 if st.mode in (st.TITLE, st.GAME_OVER, st.VICTORY) and e.key == pygame.K_SPACE:
                     st.start_game()
+                elif st.mode == st.LEVEL_BREAK and e.key == pygame.K_SPACE:
+                    st.break_continue()
                 else:
                     st.action(self.KEYS[e.key])
 
     def step(self, dt):
         """Fixed 120 Hz simulation steps keep physics and collisions frame-rate independent."""
-        self.accum = getattr(self, "accum", 0.0) + dt
+        self.accum += dt
         while self.accum >= SIM_DT:
             self.state.update(SIM_DT)
             self.accum -= SIM_DT
         self.sync_audio()
+        # auto-lower graphics if the machine struggles (about 40 fps or worse for two seconds)
+        self.ema += (dt - self.ema) * 0.05
+        if self.quality < 2 and self.ema > 0.025:
+            self.slow_t += dt
+            if self.slow_t > 2.0:
+                self.set_quality(self.quality + 1)
+                self.slow_t = 0.0
+        else:
+            self.slow_t = max(0.0, self.slow_t - dt)
 
     def sync_audio(self):
         st, au = self.state, self.audio
@@ -1608,17 +2161,22 @@ class Game:
             if st.mode == st.PLAYING:
                 if self._last_mode == st.PAUSED:
                     au.pause(False)
+                elif self._last_mode == st.LEVEL_BREAK:
+                    au.duck(False)
                 else:
                     au.start_music()
             elif st.mode == st.PAUSED:
                 au.pause(True)
+            elif st.mode == st.LEVEL_BREAK:
+                au.duck(True)
             elif st.mode in (st.GAME_OVER, st.VICTORY):
+                au.duck(False)
                 au.stop_music()
             self._last_mode = st.mode
 
     def run(self):
         while self.running:
-            dt = min(self.clock.tick(FPS) / 1000.0, 0.1)
+            dt = min(self.clock.tick(FPS_CAP) / 1000.0, 0.1)
             for e in pygame.event.get():
                 self.handle_event(e)
             self.step(dt)
@@ -1635,20 +2193,23 @@ class Game:
             if o.kind == "pit":
                 o.draw_ground(surf, lm, lvl)
         lvl.draw_decor(surf, lm, st.travel)
+        if st.chase is not None:
+            gap = st.chase["gap"]
+            draw_pursuer(surf, st.chase["who"], lm.px(p.x * 0.5) + math.sin(st.t * 9) * 5,
+                         HORIZON + 30 + (1 - gap) * 150 + abs(math.sin(st.t * 8)) * 6, 0.42 + (1 - gap) * 0.9, st.t)
         items = [(o.dist, 0, o) for o in st.obstacles if o.kind != "pit"]
         items += [(c.dist, 1, c) for c in st.tesseracts]
-        items.append((0.0, 2, p))
+        if st.mode != st.LEVEL_BREAK:
+            items.append((0.0, 2, p))
         items.sort(key=lambda it: (-it[0], it[1]))
         for _, _, obj in items:
             if obj is p:
                 p.draw(surf, st.t)
-            elif isinstance(obj, Tesseract):
-                obj.draw(surf, lm)
             else:
                 obj.draw(surf, lm)
         for part in st.particles:
             part.draw(surf)
-        if st.player.aura > 0:                                    # green screen tint
+        if st.player.aura > 0 and FX["tint"]:                      # green screen tint
             fill_alpha(surf, (0, 0, W, H), (40, 255, 120), 26 + 10 * math.sin(st.t * 12))
 
     # -- HUD ----------------------------------------------------------------
@@ -1664,40 +2225,50 @@ class Game:
     def draw_hud(self, surf):
         st = self.state
         lvl = st.level
-        fill_alpha(surf, (10, 10, 400, 92), BLACK, 140)
-        draw_text(surf, f"LEVEL {lvl.num}/3", 26, GOLD, (20, 16), "topleft", ow=2)
-        draw_text(surf, lvl.title, 18, WHITE, (20, 44), "topleft", ow=2)
+        # top-left: level, name, distance
+        fill_alpha(surf, (10, 10, 480, 124), (8, 10, 24), 215)
+        pygame.draw.rect(surf, GOLD, (10, 10, 480, 124), 2)
+        draw_text(surf, f"LEVEL {lvl.num} / 3", 34, GOLD, (24, 16), "topleft", ow=3)
+        draw_text(surf, lvl.title, 22, WHITE, (24, 54), "topleft", ow=2)
         left = max(0, int(lvl.length - st.level_dist))
-        draw_text(surf, f"DISTANCE REMAINING: {left} m", 20, (150, 255, 180), (20, 66), "topleft", ow=2)
+        draw_text(surf, f"DISTANCE LEFT: {left} m", 28, (160, 255, 190), (24, 80), "topleft", ow=3)
         frac = clamp(st.level_dist / lvl.length, 0, 1)
-        pygame.draw.rect(surf, (30, 30, 30), (20, 90, 380, 8))
-        pygame.draw.rect(surf, GREEN, (20, 90, int(380 * frac), 8))
-        pygame.draw.rect(surf, WHITE, (20, 90, 380, 8), 1)
-
-        fill_alpha(surf, (W - 260, 10, 250, 92), BLACK, 140)
-        draw_text(surf, f"{int(st.score):07d}", 38, WHITE, (W - 20, 14), "topright")
-        draw_cube(surf, W - 232, 78, 14, st.t * 3)
-        draw_text(surf, f"x {st.tess}", 30, CYAN, (W - 205, 62), "topleft", ow=2)
-
-        for i in range(START_LIVES):
-            self.helmet_icon(surf, 40 + i * 48, H - 52, 1.0, dim=i >= st.lives)
-        draw_text(surf, "LIVES", 16, WHITE, (20, H - 22), "topleft", ow=2)
-
-        bx, by, bw, bh = W // 2 - 190, H - 46, 380, 24
+        pygame.draw.rect(surf, (30, 30, 40), (24, 116, 452, 10))
+        pygame.draw.rect(surf, GREEN, (24, 116, int(452 * frac), 10))
+        pygame.draw.rect(surf, WHITE, (24, 116, 452, 10), 1)
+        # top-right: score, tesseracts, apples
+        fill_alpha(surf, (W - 290, 10, 280, 124), (8, 10, 24), 215)
+        pygame.draw.rect(surf, GOLD, (W - 290, 10, 280, 124), 2)
+        draw_text(surf, "SCORE", 18, (190, 200, 220), (W - 24, 14), "topright", ow=2)
+        draw_text(surf, f"{int(st.score):07d}", 46, WHITE, (W - 24, 30), "topright", ow=3)
+        draw_cube(surf, W - 262, 104, 15, st.t * 3, glow=False)
+        draw_text(surf, f"x {st.tess}", 34, CYAN, (W - 240, 86), "topleft", ow=3)
+        draw_apple(surf, W - 140, 106, 13, st.t)
+        draw_text(surf, f"x {st.apples}", 34, GOLD, (W - 120, 86), "topleft", ow=3)
+        # bottom-left: lives
+        n = min(MAX_LIVES, max(START_LIVES, st.lives))
+        fill_alpha(surf, (10, H - 82, 40 + n * 44, 72), (8, 10, 24), 215)
+        pygame.draw.rect(surf, GOLD, (10, H - 82, 40 + n * 44, 72), 2)
+        draw_text(surf, "LIVES", 20, WHITE, (22, H - 78), "topleft", ow=2)
+        for i in range(n):
+            self.helmet_icon(surf, 38 + i * 44, H - 34, 1.0, dim=i >= st.lives)
+        # bottom-centre: glorious purpose meter
+        bx, by, bw, bh = W // 2 - 190, H - 44, 400, 28
+        fill_alpha(surf, (bx - 12, by - 40, bw + 24, bh + 52), (8, 10, 24), 215)
         pygame.draw.rect(surf, (10, 25, 15), (bx - 4, by - 4, bw + 8, bh + 8))
         full = st.meter >= 100
         for i in range(int(bw * clamp(st.meter / 100, 0, 1))):
             pygame.draw.line(surf, mix((30, 180, 80), GOLD, i / bw), (bx + i, by), (bx + i, by + bh))
         pygame.draw.rect(surf, GOLD if (full and int(st.t * 6) % 2) else WHITE, (bx - 4, by - 4, bw + 8, bh + 8), 3)
         label = "LOVE IS A DAGGER!" if st.player.aura > 0 else "GLORIOUS PURPOSE"
-        draw_text(surf, label, 18, WHITE, (W // 2, by - 14), "center", ow=2)
+        draw_text(surf, label, 24, WHITE, (W // 2, by - 20), "center", ow=3)
         if full and st.player.aura <= 0 and int(st.t * 5) % 2 == 0:
-            draw_text(surf, "PRESS  F !", 24, (150, 255, 170), (W // 2, by + bh // 2), "center", ow=2)
+            draw_text(surf, "PRESS  F !", 28, (160, 255, 180), (W // 2, by + bh // 2), "center", ow=3)
 
     def draw_banners(self, surf):
         st = self.state
         for i, b in enumerate(st.banners):
-            b.draw(surf, 190 + i * 78)
+            b.draw(surf, 210 + i * 80)
 
     # -- overlays -------------------------------------------------------
     def draw_level_card(self, surf):
@@ -1707,55 +2278,134 @@ class Game:
             return
         a = clamp(min(t, 3.6 - t) / 0.35, 0, 1)
         lvl = st.level
-        fill_alpha(surf, (0, 350, W, 120), BLACK, 160 * a)
-        for img_args in ((f"LEVEL {lvl.num}", 56, GOLD, 384), (lvl.title, 34, WHITE, 436), (f"~ {lvl.year} ~", 22, (150, 255, 180), 466)):
-            img = text_surf(img_args[0], img_args[1], img_args[2], BLACK, 3)
-            img = img.copy()
+        fill_alpha(surf, (0, 340, W, 150), BLACK, 190 * a)
+        for txt, size, col, y in ((f"LEVEL {lvl.num}", 64, GOLD, 378), (lvl.title, 38, WHITE, 436), (f"~ {lvl.year} ~", 26, (160, 255, 190), 472)):
+            img = text_surf(txt, size, col, BLACK, 3).copy()
             img.set_alpha(int(255 * a))
-            surf.blit(img, img.get_rect(center=(W // 2, img_args[3])))
+            surf.blit(img, img.get_rect(center=(W // 2, y)))
 
     def draw_title(self, surf):
         st = self.state
-        fill_alpha(surf, (0, 0, W, H), BLACK, 110)
+        fill_alpha(surf, (0, 0, W, H), BLACK, 130)
         bob = math.sin(st.t * 3) * 6
-        img = text_surf("LOKIMAN", 150, GREEN, (10, 40, 20), 8)
-        surf.blit(img, img.get_rect(center=(W // 2, 130 + bob)))
-        draw_text(surf, "BURDENED WITH GLORIOUS PURPOSE", 30, (150, 255, 180), (W // 2, 215), ow=3)
-        lines = ["A / D  or  LEFT / RIGHT   -  SHIFT LANES",
-                 "W / UP / SPACE   -  JUMP LOW BARRIERS",
-                 "S / DOWN   -  SLIDE UNDER HIGH HAZARDS",
-                 "F   -  GLORIOUS PURPOSE (METER FULL)     P  -  PAUSE"]
+        img = text_surf("LOKIMAN", 160, GREEN, (10, 40, 20), 8)
+        surf.blit(img, img.get_rect(center=(W // 2, 120 + bob)))
+        draw_text(surf, "BURDENED WITH GLORIOUS PURPOSE", 34, (170, 255, 190), (W // 2, 214), ow=3)
+        fill_alpha(surf, (W // 2 - 400, 250, 800, 220), (8, 10, 24), 200)
+        draw_text(surf, "COLLECT TESSERACTS.  JUMP FOR GOLDEN APPLES.  OUTRUN THE MULTIVERSE.", 22, CYAN, (W // 2, 272), ow=2)
+        lines = ["A / D   or   LEFT / RIGHT   -   SHIFT LANES",
+                 "W / UP / SPACE   -   JUMP LOW BARRIERS",
+                 "S / DOWN   -   SLIDE UNDER HIGH HAZARDS",
+                 "F   -   GLORIOUS PURPOSE (WHEN THE METER IS FULL)"]
         for i, ln in enumerate(lines):
-            draw_text(surf, ln, 22, WHITE, (W // 2, 380 + i * 30), ow=2)
-        draw_text(surf, "COLLECT THE TESSERACTS. OUTRUN THE MULTIVERSE.", 22, CYAN, (W // 2, 340), ow=2)
+            draw_text(surf, ln, 25, WHITE, (W // 2, 318 + i * 34), ow=2)
+        draw_text(surf, "P PAUSE    M MUTE    F11 FULLSCREEN    Q GRAPHICS    ESC QUIT", 18, (200, 205, 220), (W // 2, 458), ow=2)
+        if st.best:
+            draw_text(surf, f"BEST SCORE  {st.best:07d}", 30, GOLD, (W // 2, 505), ow=3)
         if int(st.t * 2.5) % 2 == 0:
-            draw_text(surf, "PRESS ENTER TO RUN", 44, GOLD, (W // 2, 540), ow=4)
+            draw_text(surf, "PRESS ENTER TO RUN", 50, GOLD, (W // 2, 570), ow=4)
+
+    # -- level break (tally) screen -------------------------------------
+    def draw_break(self, surf):
+        st = self.state
+        b = st.brk
+        t = b["t"]
+        rows = b["rows"]
+        fill_alpha(surf, (0, 0, W, H), (12, 6, 34), 215)
+        fill_alpha(surf, (24, 24, 600, H - 48), (8, 10, 24), 225)
+        pygame.draw.rect(surf, GOLD, (24, 24, 600, H - 48), 3)
+        draw_text(surf, f"LEVEL {st.level.num} COMPLETE!", 50, GOLD, (324, 76), ow=5)
+        draw_text(surf, st.level.title, 24, WHITE, (324, 126), ow=3)
+        revealed = 0
+        for i, (label, val, pts, icon) in enumerate(rows):
+            if t < i * BREAK_ROW_T:
+                break
+            local = clamp((t - i * BREAK_ROW_T) / 0.8, 0, 1)
+            revealed += int(pts * local)
+            y = 170 + i * 78
+            fill_alpha(surf, (40, y, 568, 66), (30, 34, 66), 230)
+            cx, cy = 76, y + 33
+            if icon == "cube":
+                draw_cube(surf, cx, cy, 18, t * 3, glow=False)
+            elif icon == "apple":
+                draw_apple(surf, cx, cy + 3, 16, t)
+            elif icon == "helmet":
+                self.helmet_icon(surf, cx, cy, 1.2)
+            else:
+                pygame.draw.line(surf, WHITE, (cx - 14, cy + 20), (cx - 14, cy - 22), 4)
+                pygame.draw.polygon(surf, GOLD, [(cx - 12, cy - 22), (cx + 22, cy - 12), (cx - 12, cy)])
+            draw_text(surf, label, 28, WHITE, (110, y + 9), "topleft", ow=3)
+            draw_text(surf, val, 24, CYAN if icon != "helmet" else (160, 255, 190), (110, y + 38), "topleft", ow=2)
+            col = GOLD if pts > 0 else (150, 150, 160)
+            draw_text(surf, "+%d" % int(pts * local), 40, col, (594, y + 33), "midright", ow=3)
+        n = len(rows)
+        if t >= n * BREAK_ROW_T:
+            draw_text(surf, "LEVEL BONUS", 28, (190, 200, 230), (60, 500), "topleft", ow=3)
+            draw_text(surf, "+%d" % b["total"], 52, WHITE, (594, 520), "midright", ow=4)
+            draw_text(surf, f"SCORE  {int(b['score0'] + b['total']):07d}", 34, GOLD, (324, 570), ow=4)
+        if b["done"]:
+            if int(st.t * 2.5) % 2 == 0:
+                draw_text(surf, "PRESS ENTER TO CONTINUE", 30, (160, 255, 190), (324, 604), ow=3)
+        else:
+            draw_text(surf, "ENTER: SKIP", 20, (200, 205, 220), (324, 604), ow=2)
+        # a very silly Loki
+        p = st.player
+        p.front = True
+        pose = "jump" if math.sin(st.t * 5) > 0 else "run"
+        base = p.sprite(pose, int(st.t * 8) % 12)
+        p.front = False
+        bounce = abs(math.sin(st.t * 5)) * 46
+        img = pygame.transform.rotozoom(base, math.sin(st.t * 5) * 14, 2.0)
+        surf.blit(img, img.get_rect(midbottom=(780, 560 - bounce)))
+        pygame.draw.ellipse(surf, (0, 0, 0), (700, 550, 160, 28))
+        quip = wrap_text(b["quip"], 26, 270)
+        bh = 36 * len(quip) + 28
+        bx, by = 640, 60
+        pygame.draw.rect(surf, WHITE, (bx, by, 300, bh), border_radius=16)
+        pygame.draw.rect(surf, BLACK, (bx, by, 300, bh), 3, border_radius=16)
+        pygame.draw.polygon(surf, WHITE, [(bx + 140, by + bh - 2), (bx + 190, by + bh - 2), (bx + 170, by + bh + 40)])
+        pygame.draw.lines(surf, BLACK, False, [(bx + 140, by + bh - 1), (bx + 170, by + bh + 40), (bx + 190, by + bh - 1)], 3)
+        for i, ln in enumerate(quip):
+            draw_text(surf, ln, 26, BLACK, (bx + 150, by + 30 + i * 36), "center", outline=WHITE, ow=0)
 
     def draw_end(self, surf, victory):
         st = self.state
-        fill_alpha(surf, (0, 0, W, H), BLACK, 170 if victory else 150)
+        fill_alpha(surf, (0, 0, W, H), BLACK, 175 if victory else 160)
         if victory:
             t = st.victory_t
             k = 1 + 0.04 * math.sin(t * 5)
-            for txt, size, col, y in (("MULTIVERSE SAVED...", 84, (120, 255, 160), 130),
-                                       ("KNEEL BEFORE YOUR KING!", 70, GOLD, 230)):
+            for txt, size, col, y in (("MULTIVERSE SAVED...", 88, (120, 255, 160), 120),
+                                       ("KNEEL BEFORE YOUR KING!", 72, GOLD, 220)):
                 img = text_surf(txt, size, col, BLACK, 6)
                 fit = min(1.0, (W - 40) / img.get_width())
                 img = pygame.transform.rotozoom(img, math.sin(t * 2) * 2, k * fit)
                 surf.blit(img, img.get_rect(center=(W // 2, y)))
-            big = pygame.transform.rotozoom(st.player.sprite("jump", 0), 0, 1.1)
-            surf.blit(big, big.get_rect(midbottom=(W // 2, 585 + math.sin(t * 4) * 6)))
-            blit_glow(surf, W // 2, 490, 160, (90, 255, 140), 90)
-            draw_text(surf, f"FINAL SCORE  {int(st.score):07d}", 46, WHITE, (W // 2, 320), ow=4)
-            draw_text(surf, f"TESSERACTS {st.tess}     LIVES LEFT {max(0, st.lives)}", 26, CYAN, (W // 2, 372), ow=3)
+            p = st.player
+            p.front = True
+            big = pygame.transform.rotozoom(p.sprite("jump", 0), math.sin(t * 4) * 8, 1.1)
+            p.front = False
+            surf.blit(big, big.get_rect(midbottom=(W // 2, 600 + math.sin(t * 4) * 6)))
+            blit_glow(surf, W // 2, 500, 170, (90, 255, 140), 90)
+            draw_text(surf, f"FINAL SCORE  {int(st.score):07d}", 50, WHITE, (W // 2, 318), ow=4)
+            if st.new_best:
+                draw_text(surf, "NEW BEST SCORE!", 30, GOLD, (W // 2, 360), ow=3)
+            else:
+                draw_text(surf, f"BEST  {st.best:07d}", 26, GOLD, (W // 2, 360), ow=3)
+            draw_text(surf, f"TESSERACTS {st.tess_total}     GOLDEN APPLES {st.apples}     LIVES LEFT {max(0, st.lives)}",
+                      26, CYAN, (W // 2, 402), ow=3)
             if int(t * 2.5) % 2 == 0:
-                draw_text(surf, "PRESS ENTER TO RULE AGAIN", 30, GOLD, (W // 2, 618), ow=3)
+                draw_text(surf, "PRESS ENTER TO RULE AGAIN", 32, GOLD, (W // 2, 620), ow=3)
         else:
-            draw_text(surf, "GAME OVER", 110, (255, 90, 80), (W // 2, 230), ow=6)
-            draw_text(surf, f"SCORE  {int(st.score):07d}", 44, WHITE, (W // 2, 340), ow=4)
-            draw_text(surf, f"REACHED LEVEL {st.level.num}  -  {int(st.total_dist)} m", 26, CYAN, (W // 2, 392), ow=3)
+            draw_text(surf, "GAME OVER", 120, (255, 90, 80), (W // 2, 220), ow=6)
+            draw_text(surf, f"SCORE  {int(st.score):07d}", 50, WHITE, (W // 2, 330), ow=4)
+            if st.new_best:
+                draw_text(surf, "NEW BEST SCORE!", 30, GOLD, (W // 2, 376), ow=3)
+            else:
+                draw_text(surf, f"BEST  {st.best:07d}", 28, GOLD, (W // 2, 376), ow=3)
+            draw_text(surf, f"REACHED LEVEL {st.level.num}   -   {int(st.total_dist)} m   -   {st.tess_total} TESSERACTS   -   {st.apples} APPLES",
+                      22, CYAN, (W // 2, 420), ow=3)
             if int(st.t * 2.5) % 2 == 0:
-                draw_text(surf, "PRESS ENTER TO TRY AGAIN", 34, GOLD, (W // 2, 480), ow=3)
+                draw_text(surf, "PRESS ENTER TO TRY AGAIN", 38, GOLD, (W // 2, 500), ow=4)
 
     def draw(self):
         st = self.state
@@ -1770,19 +2420,27 @@ class Game:
         scr = self.screen
         if st.mode == st.TITLE:
             self.draw_title(scr)
-            return
-        if st.mode != st.VICTORY:
-            self.draw_hud(scr)
-        self.draw_banners(scr)
-        if st.mode == st.PLAYING or st.mode == st.PAUSED:
-            self.draw_level_card(scr)
-        if st.mode == st.PAUSED:
-            fill_alpha(scr, (0, 0, W, H), BLACK, 140)
-            draw_text(scr, "PAUSED", 100, GOLD, (W // 2, H // 2), ow=6)
-        elif st.mode == st.GAME_OVER:
-            self.draw_end(scr, False)
-        elif st.mode == st.VICTORY:
-            self.draw_end(scr, True)
+        elif st.mode == st.LEVEL_BREAK:
+            for part in st.particles:
+                part.draw(scr)
+            self.draw_break(scr)
+        else:
+            if st.mode != st.VICTORY:
+                self.draw_hud(scr)
+            self.draw_banners(scr)
+            if st.mode in (st.PLAYING, st.PAUSED):
+                self.draw_level_card(scr)
+            if st.mode == st.PAUSED:
+                fill_alpha(scr, (0, 0, W, H), BLACK, 150)
+                draw_text(scr, "PAUSED", 110, GOLD, (W // 2, H // 2), ow=6)
+                draw_text(scr, "PRESS P TO RESUME", 30, WHITE, (W // 2, H // 2 + 80), ow=3)
+            elif st.mode == st.GAME_OVER:
+                self.draw_end(scr, False)
+            elif st.mode == st.VICTORY:
+                self.draw_end(scr, True)
+        if self.show_fps:
+            fps = 1.0 / max(self.ema, 1e-4)
+            draw_text(scr, f"FPS {fps:0.0f}  GFX {self.quality}", 22, (255, 255, 120), (W // 2, 12), "midtop", ow=2)
 
 
 def main():
