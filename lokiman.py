@@ -9,6 +9,7 @@ Controls
     W / UP / SPACE            jump over low barriers
     S / DOWN                  superhero slide under high hazards
     F                         unleash GLORIOUS PURPOSE (when the meter is full)
+                              (it also hurts bosses; Tesseracts damage them too)
     F11 or Cmd+F              toggle fullscreen
     M                         mute / unmute
     Q                         cycle graphics quality (auto-lowers if slow)
@@ -63,6 +64,10 @@ START_LIVES = 3
 MAX_LIVES = 5
 APPLES_PER_LIFE = 10
 CHASE_LEN = 320.0
+REV_D0 = 14.0             # Loki's distance from the camera in the reversed (Alioth) scene
+MJ_WARN_D = 46.0          # Mjolnir warning flash appears this far ahead
+MJ_LAUNCH = 16.0          # ...and the hammer is thrown at this distance
+MJ_VX = 12.0              # hammer speed in lanes per second
 BEST_FILE = "lokiman_best.txt"
 
 GOLD = (245, 200, 40)
@@ -236,6 +241,20 @@ class LaneManager:
 
     def __init__(self):
         self.cam = 0.0           # camera sway (lane units) that follows Loki
+        self.rev = False         # reversed camera: Loki runs towards the screen, hazards rise from the bottom
+
+    @property
+    def pscale(self):
+        return ND / (ND + REV_D0) if self.rev else 1.0
+
+    @property
+    def sprite_k(self):
+        return self.pscale * 1.45 if self.rev else 1.0
+
+    @property
+    def gy(self):
+        """Screen y of Loki's feet."""
+        return HORIZON + (PLAYER_Y - HORIZON) * self.pscale
 
     @staticmethod
     def lane_x(lane):
@@ -243,7 +262,7 @@ class LaneManager:
 
     def px(self, lx):
         """Screen x of lane position lx on the player's line (scale 1)."""
-        return W / 2 + (lx - self.cam) * LANE_W
+        return W / 2 + (lx - self.cam) * LANE_W * self.pscale
 
     def clamp_lane(self, lane):
         return int(clamp(lane, 0, self.COUNT - 1))
@@ -254,6 +273,8 @@ class LaneManager:
 
     def project(self, lx, dist):
         """lane-unit x and world distance -> (screen x, screen y, scale)."""
+        if self.rev:
+            dist = REV_D0 - dist
         s = self.scale(dist)
         return W / 2 + (lx - self.cam) * LANE_W * s, HORIZON + (PLAYER_Y - HORIZON) * s, s
 
@@ -297,6 +318,7 @@ class Level:
     DECOR_SPACING = 10.0
 
     def __init__(self, num, title, year, length, theme, obstacles, pal, scenes=()):
+        self.boss = None
         self.scenes = [dict(kind=k, at=a) for k, a in scenes]
         self.num, self.title, self.year, self.length = num, title, year, length
         self.theme, self.obstacles, self.pal = theme, obstacles, pal
@@ -483,7 +505,7 @@ class Level:
 
 
 def build_levels():
-    return [
+    levels = [
         Level(1, "THE BATTLE OF NEW YORK", "2012", 1500, "city",
               [("taxi", 3), ("glider", 3), ("shock", 3)],
               dict(sky_top=(30, 45, 75), sky_bot=(225, 130, 70), ground=(40, 40, 45),
@@ -504,8 +526,11 @@ def build_levels():
                    road_a=(74, 44, 106), road_b=(64, 36, 94), line=(190, 120, 255),
                    curb_a=(130, 60, 200), curb_b=(60, 200, 140), side_a=(52, 30, 72),
                    side_b=(44, 26, 62), fog=(120, 50, 150), pit_rim=(200, 100, 255)),
-              scenes=(('stampede', 0.33), ('chase:alioth', 0.68))),
+              scenes=(('stampede', 0.28), ('stampede', 0.6))),
     ]
+    for lvl, boss in zip(levels, ('hulk', 'thor', 'alioth')):
+        lvl.boss = boss
+    return levels
 
 
 # --------------------------------------------------------------------------
@@ -582,6 +607,7 @@ SPECS = {
     "ship":    dict(kind="heavy", width=1.4, depth=2.8, clear=0),
     "smoke":   dict(kind="high",  width=1.0, depth=1.6, clear=0),
     "fist":    dict(kind="heavy", width=0.95, depth=2.2, clear=0),
+    "mjolnir": dict(kind="high",  width=0.9,  depth=1.2, clear=0),
     "pit":     dict(kind="pit",   width=0.9, depth=5.0, clear=26),
 }
 
@@ -598,11 +624,34 @@ class Obstacle:
         self.bt = 0.0
         self.bdir = 1
         self.landed = False
+        self.launched = True              # Mjolnir: False while only the red warning shows
+        self.target = lane_x
+        self.dirn = 1
+        self.announced = False
+
+    @classmethod
+    def mjolnir(cls, target_lane_x, dist):
+        o = cls("mjolnir", 99.0, dist)          # parked off-screen until it is thrown
+        o.target, o.launched, o.dirn = target_lane_x, False, random.choice((-1, 1))
+        return o
+
+    @property
+    def ground(self):
+        """Drawn flat on the road (pits and the Mjolnir warning)."""
+        return self.kind == "pit" or (self.key == "mjolnir" and not self.launched)
+
+    @property
+    def blastable(self):
+        return self.kind != "pit" and (self.key != "mjolnir" or self.launched)
 
     def update(self, dt, speed):
         self.prev_dist = self.dist
         self.dist -= speed * dt
         self.t += dt
+        if self.key == "mjolnir" and not self.launched and self.dist <= MJ_LAUNCH:
+            self.launched = True                                    # thrown: arrives in the target lane as it reaches Loki
+            self.vx = self.dirn * MJ_VX
+            self.lane_x = self.target - self.vx * max(self.dist, 0.2) / max(speed, 1.0)
         self.lane_x += self.vx * dt
         if self.blasted:
             self.bt += dt
@@ -622,8 +671,29 @@ class Obstacle:
         self.vx = 0
 
     # -- drawing ----------------------------------------------------------
+    def _draw_warning(self, surf, lm):
+        """Red flashing lane: Thor is about to throw Mjolnir across it."""
+        if self.dist > MJ_WARN_D or self.dist < MJ_LAUNCH - 6:
+            return
+        pts = []
+        for lx, d in ((self.target - 0.5, self.dist - 2.5), (self.target + 0.5, self.dist - 2.5),
+                      (self.target + 0.5, self.dist + 2.5), (self.target - 0.5, self.dist + 2.5)):
+            sx, sy, _ = lm.project(lx, d)
+            pts.append((sx, sy))
+        on = int(self.t * 9) % 2 == 0
+        pygame.draw.polygon(surf, (255, 40, 40) if on else (150, 10, 20), pts)
+        pygame.draw.polygon(surf, WHITE, pts, 2)
+        sx, sy, s = lm.project(self.target, self.dist)
+        if s > 0.12:
+            ppoly(surf, (255, 220, 40), (sx, sy), s, [(0, -112), (-34, -52), (34, -52)])
+            pline(surf, BLACK, (sx, sy), s, 0, -98, 0, -76, 7)
+            pcirc(surf, BLACK, (sx, sy), s, 0, -64, 4)
+
     def draw_ground(self, surf, lm, level):
         """Pits are painted flat on the road."""
+        if self.key == "mjolnir":
+            self._draw_warning(surf, lm)
+            return
         near, far = self.dist - self.depth / 2, self.dist + self.depth / 2
         if far < -5 or near > FAR:
             return
@@ -681,6 +751,25 @@ class Obstacle:
                 pline(surf, (20, 20, 20), a, s, dx, dy, dx * 2.1, dy - 14, 3)
             for j in range(4):
                 pcirc(surf, (170, 170, 160), a, s, -60 + j * 40, -20 - (t * 60 + j * 20) % 40, 12)
+
+    def _draw_mjolnir(self, surf, a, s, t):
+        d = 1 if self.vx >= 0 else -1
+        c = (a[0], a[1] - 78 * s)
+        for j in range(5):                                             # lightning trail
+            pline(surf, (170, 220, 255), (c[0], c[1]), s, -d * (60 + j * 26), (j % 2 * 2 - 1) * 10, -d * (90 + j * 26), -(j % 2 * 2 - 1) * 12, 3)
+        blit_glow(surf, c[0], c[1], 70 * s + 8, (150, 200, 255), 160)
+        ang = t * 16 * d
+
+        def rot(px, py):
+            return (c[0] + (px * math.cos(ang) - py * math.sin(ang)) * s, c[1] + (px * math.sin(ang) + py * math.cos(ang)) * s)
+        handle = [rot(-6, -2), rot(6, -2), rot(6, 70), rot(-6, 70)]
+        head = [rot(-42, -40), rot(42, -40), rot(42, 4), rot(-42, 4)]
+        shade = [rot(-42, -18), rot(42, -18), rot(42, 4), rot(-42, 4)]
+        pygame.draw.polygon(surf, (110, 70, 40), handle)
+        pygame.draw.polygon(surf, (190, 196, 210), head)
+        pygame.draw.polygon(surf, (120, 126, 142), shade)
+        pygame.draw.polygon(surf, WHITE, head, 2)
+        pygame.draw.polygon(surf, (210, 40, 40), [rot(-6, 44), rot(6, 44), rot(18, 74), rot(-18, 74)])   # red cloth
 
     def _draw_taxi(self, surf, a, s, t):
         prect(surf, (20, 20, 22), a, s, -58, -18, 26, 20)
@@ -871,18 +960,18 @@ class Banner:
 
     def draw(self, surf, y):
         t = self.t
-        pop = 1.0 + max(0.0, 0.7 * math.exp(-t * 9) * math.cos(t * 28))
-        pop *= min(1.0, t / 0.08 + 0.001)
-        fade = clamp((self.dur - t) / 0.3, 0, 1)
-        size = 74
-        img = text_surf(self.text, size, self.color, BLACK, 5)
-        fit = min(1.0, (W - 40) / img.get_width())
-        k = pop * fit
-        img = pygame.transform.rotozoom(img, math.sin(t * 6) * 3, k)
+        fade = clamp(min(t / 0.12, (self.dur - t) / 0.3), 0, 1)
+        img = text_surf(self.text, 46, self.color, BLACK, 3)
+        k = min(1.0, (W - 90) / img.get_width()) * (1 + 0.22 * max(0.0, 1 - t / 0.16))
+        if abs(k - 1) > 0.01:
+            img = pygame.transform.smoothscale(img, (max(2, int(img.get_width() * k)), max(2, int(img.get_height() * k))))
+        rect = pygame.Rect(0, 0, img.get_width() + 40, img.get_height() + 8)
+        rect.center = (W // 2, y)
+        fill_alpha(surf, rect, (8, 10, 26), 225 * fade)
+        if fade > 0.6:
+            pygame.draw.rect(surf, self.color, rect, 3)
         img.set_alpha(int(255 * fade))
-        bh = int(img.get_height() * 0.8) // 4 * 4
-        fill_alpha(surf, (0, y - bh // 2, W, bh), BLACK, 110 * fade)
-        surf.blit(img, img.get_rect(center=(W // 2 + math.sin(t * 40) * 2 * math.exp(-t * 6), y)))
+        surf.blit(img, img.get_rect(center=rect.center))
 
 
 # --------------------------------------------------------------------------
@@ -1131,51 +1220,69 @@ class Player:
             self._ghosts_img[key] = g
         return g
 
+    _scaled = {}
+
+    @classmethod
+    def _sc(cls, img, k):
+        if abs(k - 1) < 0.01:
+            return img
+        key = (id(img), int(k * 100))
+        out = cls._scaled.get(key)
+        if out is None:
+            if len(cls._scaled) > 80:
+                cls._scaled.clear()
+            out = pygame.transform.rotozoom(img, 0, k)
+            cls._scaled[key] = out
+        return out
+
     def draw(self, surf, t):
-        sx = self.lm.px(self.x)
-        gy = PLAYER_Y
+        lm = self.lm
+        k = lm.sprite_k                   # 1.0 normally; smaller when the camera is reversed
+        sx = lm.px(self.x)
+        gy = lm.gy
+        jh = self.jump_h * k
         # shadow
         sh = clamp(1 - self.jump_h / 220, 0.35, 1)
         if self.fall <= 0:
-            pellipse(surf, (0, 0, 0), (sx, gy), 1, -42 * sh, -8, 84 * sh, 16)
+            pellipse(surf, (0, 0, 0), (sx, gy), k, -42 * sh, -8, 84 * sh, 16)
         # illusion trail
         for x, h, life, pose, frame in self.ghosts:
-            img = self.ghost_img(pose, frame)
+            img = self._sc(self.ghost_img(pose, frame), k)
             img.set_alpha(int(170 * life / 0.4))
-            surf.blit(img, img.get_rect(midbottom=(self.lm.px(x), gy - h)))
+            surf.blit(img, img.get_rect(midbottom=(lm.px(x), gy - h * k)))
         if self.invuln > 0 and self.tumble <= 0 and self.fall <= 0 and self.aura <= 0 and int(t * 18) % 2:
             return
-        cy = gy - self.jump_h
+        cy = gy - jh
         if self.aura > 0:                                               # green magic aura
             pulse = 1 + 0.12 * math.sin(t * 14)
-            blit_glow(surf, sx, cy - 80, 150 * pulse, (60, 255, 120), 200)
+            blit_glow(surf, sx, cy - 80 * k, 150 * k * pulse, (60, 255, 120), 200)
             for i in range(6):
                 ang = t * 4 + i * math.pi / 3
-                pygame.draw.circle(surf, (190, 255, 210), (int(sx + math.cos(ang) * 78), int(cy - 80 + math.sin(ang) * 92)), 5)
+                pygame.draw.circle(surf, (190, 255, 210), (int(sx + math.cos(ang) * 78 * k), int(cy - 80 * k + math.sin(ang) * 92 * k)), 5)
         if self.fall > 0:                                               # dropping into the pit
             p = 1 - self.fall / FALL_TIME
-            img = pygame.transform.rotozoom(self.sprite("jump", 0), p * 200, 1 - p * 0.35)
+            img = pygame.transform.rotozoom(self.sprite("jump", 0), p * 200, (1 - p * 0.35) * k)
             old = surf.get_clip()
-            surf.set_clip(pygame.Rect(0, 0, W, gy + 6))
-            surf.blit(img, img.get_rect(center=(sx, gy - 70 + p * p * 300)))
+            surf.set_clip(pygame.Rect(0, 0, W, int(gy) + 6))
+            surf.blit(img, img.get_rect(center=(sx, gy - 70 * k + p * p * 300 * k)))
             surf.set_clip(old)
             return
         if self.tumble > 0:                                             # slapstick somersault
             p = 1 - self.tumble / TUMBLE_TIME
-            img = pygame.transform.rotozoom(self.sprite("jump", 0), -p * 720, 1)
-            hop = abs(math.sin(p * math.pi * 2)) * 70
-            surf.blit(img, img.get_rect(center=(sx, gy - 70 - hop)))
+            img = pygame.transform.rotozoom(self.sprite("jump", 0), -p * 720, k)
+            hop = abs(math.sin(p * math.pi * 2)) * 70 * k
+            surf.blit(img, img.get_rect(center=(sx, gy - 70 * k - hop)))
             for i in range(4):
                 ang = t * 9 + i * math.pi / 2
-                pygame.draw.circle(surf, GOLD, (int(sx + math.cos(ang) * 44), int(gy - 160 - hop + math.sin(ang) * 10)), 5)
+                pygame.draw.circle(surf, GOLD, (int(sx + math.cos(ang) * 44 * k), int(gy - 160 * k - hop + math.sin(ang) * 10)), 5)
             return
         pose = self.pose()
-        img = self.sprite(pose, int(self.run_phase * 2) % 12)
-        bob = abs(math.sin(self.run_phase)) * 5 if pose == "run" else 0
-        surf.blit(img, img.get_rect(midbottom=(sx, cy - bob + (6 if pose == "slide" else 0))))
+        img = self._sc(self.sprite(pose, int(self.run_phase * 2) % 12), k)
+        bob = abs(math.sin(self.run_phase)) * 5 * k if pose == "run" else 0
+        surf.blit(img, img.get_rect(midbottom=(sx, cy - bob + (6 * k if pose == "slide" else 0))))
         if pose == "slide":                                             # dramatic sparks
             for i in range(5):
-                pygame.draw.line(surf, (255, 220, 120), (sx - 50 + i * 24, gy - 4), (sx - 60 + i * 24 - 12, gy - 4 - i % 3 * 5), 2)
+                pygame.draw.line(surf, (255, 220, 120), (sx - 50 * k + i * 24 * k, gy - 4), (sx - 60 * k + i * 24 * k - 12, gy - 4 - i % 3 * 5), 2)
 
 
 # --------------------------------------------------------------------------
@@ -1211,6 +1318,15 @@ BREAK_QUIPS = (
     ("I'M ON A VERY TIGHT SCHEDULE. LITERALLY.", "MOBIUS, I WILL HAVE THAT JET SKI."),
     ("THE VOID? MY FAVOURITE HOLIDAY SPOT!", "KNEEL. OR AT LEAST SIT DOWN."),
 )
+BOSS_INFO = {
+    "hulk":   dict(name="THE HULK", color=(110, 235, 80), intro="BOSS: THE HULK!",
+                   defeat="HULK SMASH... HIMSELF! PUNY HULK!"),
+    "thor":   dict(name="THOR", color=(120, 190, 255), intro="BOSS: THOR! BROTHER, NO!",
+                   defeat="BROTHER... WELL PLAYED."),
+    "alioth": dict(name="ALIOTH", color=(205, 130, 255), intro="TURN AROUND! ALIOTH!",
+                   defeat="ALIOTH BANISHED! KNEEL!"),
+}
+TESS_DAMAGE = 4.2
 TESS_QUIPS = ("TESSERACT TAX COLLECTED!", "SHINY! MINE!", "THE MULTIVERSE OWES ME!", "IS THIS... GLORIOUS PURPOSE?")
 BREAK_ROW_T = 1.0
 
@@ -1257,6 +1373,7 @@ class GameState:
         self.meter_ready_said = False
         self.victory_t = 0.0
         self.new_best = False
+        self.thor_said = False
         self.brk = None
         self.player.reset()
         self.particles.clear()
@@ -1274,6 +1391,10 @@ class GameState:
         self.level_hits = 0
         self.scene_points = 0
         self.chase = None
+        self.boss = None
+        self.boss_done = False
+        self.reverse = False
+        self.lm.rev = False
         self.player.front = False
         self.announce = []
         self.scene_watch = []
@@ -1286,9 +1407,9 @@ class GameState:
     def start_game(self):
         self.reset_run()
         self.mode = self.PLAYING
-        self.card_t = 3.6
         self.sound("start")
-        self.add_banner("BURDENED WITH GLORIOUS PURPOSE!", (110, 255, 140), 2.8)
+        self.add_banner("BURDENED WITH GLORIOUS PURPOSE!", (110, 255, 140), 2.6)
+        self.add_banner("LEVEL 1: " + self.level.title, GOLD, 3.0)
 
     # -- fx -------------------------------------------------------------
     def sound(self, name):
@@ -1296,7 +1417,7 @@ class GameState:
 
     def add_banner(self, text, color, dur=2.4):
         self.banners.append(Banner(text, color, dur))
-        if len(self.banners) > 3:
+        if len(self.banners) > 2:
             self.banners.pop(0)
 
     def burst(self, x, y, color, n=10, speed=240, size=5, gravity=500):
@@ -1344,7 +1465,7 @@ class GameState:
             self.flash, self.flash_color = 0.25, (80, 255, 140)
             self.shake = 0.35
             for o in self.obstacles:
-                if o.active and o.kind != "pit" and o.dist < 30:
+                if o.active and o.blastable and o.dist < 30:
                     self.blast_obstacle(o)
 
     def blast_obstacle(self, o):
@@ -1390,11 +1511,13 @@ class GameState:
         self.play_time += dt
         self.card_t = max(0.0, self.card_t - dt)
         target = min(MAX_SPEED, BASE_SPEED + 0.16 * self.play_time + 1.5 * self.level_idx)
+        if self.reverse:
+            target = 13.0                   # obstacles rise from the bottom of the screen at a fair pace
         want = 0.5 if (p.tumble > 0 or p.fall > 0) else 1.0
         self.speed_mult += (want - self.speed_mult) * min(1, 4 * dt)
         self.speed = target * self.speed_mult * (1.12 if p.aura > 0 else 1.0) * (1.1 if self.chase else 1.0)
         step = self.speed * dt
-        self.travel += step
+        self.travel += -step if self.reverse else step
         self.level_dist += step
         self.total_dist += step
         self.score += step * 0.5
@@ -1409,6 +1532,14 @@ class GameState:
                 o.landed = True
                 self.shake = max(self.shake, 0.25)
                 self.sound("slam")
+        for o in self.obstacles:
+            if o.key == "mjolnir" and o.launched and not o.announced:
+                o.announced = True
+                self.sound("thunder")
+                self.flash, self.flash_color = 0.12, (190, 220, 255)
+                if not self.thor_said and self.boss is None:
+                    self.thor_said = True
+                    self.add_banner("THOR'S INTERFERENCE! MJOLNIR!", (150, 200, 255), 2.0)
         self.update_scenes(dt)
         self.collisions()
         self.obstacles = [o for o in self.obstacles if not o.dead]
@@ -1416,15 +1547,17 @@ class GameState:
         if p.aura > 0:
             self.meter = 100.0 * p.aura / AURA_TIME
             for o in self.obstacles:
-                if o.active and o.kind != "pit" and o.dist < 16 and abs(o.lane_x - p.x) < 1.7:
+                if o.active and o.blastable and o.dist < 16 and abs(o.lane_x - p.x) < 1.7:
                     self.blast_obstacle(o)
             sx = self.lm.px(p.x)
-            self.particles.append(Particle(sx + random.uniform(-50, 50), PLAYER_Y - p.jump_h - random.uniform(10, 150),
+            self.particles.append(Particle(sx + random.uniform(-50, 50), self.lm.gy - p.jump_h * self.lm.sprite_k - random.uniform(10, 150) * self.lm.sprite_k,
                                            random.uniform(-30, 30), -random.uniform(60, 160), 0.6, (110, 255, 160), 5))
         elif self.meter > 100:
             self.meter = 100
-        if self.level_dist >= self.level.length:
-            self.finish_level()
+        if self.boss is None and not self.boss_done and self.level_dist >= self.level.length:
+            self.start_boss()
+        if self.boss is not None:
+            self.update_boss(dt)
 
     # -- spawning ---------------------------------------------------------
     def lane_blocked(self, lane, d0, d1):
@@ -1509,6 +1642,9 @@ class GameState:
                     self.tesseracts.append(GoldenApple(ln - 1, dist + i * 2.8))
                 self.level_apples_spawned += 3
                 return
+        if self.level_idx == 1 and random.random() < 0.2:             # Thor throws Mjolnir across a lane
+            self.obstacles.append(Obstacle.mjolnir(random.choice(lanes) - 1, dist))
+            return
         if r < 0.50:                                                  # pit(s) in the road
             n = 1 if random.random() < 0.6 else 2
             start = random.randint(0, 3 - n)
@@ -1558,6 +1694,7 @@ class GameState:
                 self.tess_total += 1
                 self.level_tess += 1
                 self.score += 50
+                self.damage_boss(TESS_DAMAGE)
                 self.sound("collect%d" % (self.tess % 5))
                 if self.tess_total % 25 == 0:
                     self.add_banner(random.choice(TESS_QUIPS), (120, 220, 255), 1.6)
@@ -1567,7 +1704,7 @@ class GameState:
                         self.meter_ready_said = True
                         self.sound("ready")
                         self.add_banner("PRESS F FOR GLORIOUS PURPOSE!", (120, 220, 255), 1.8)
-                self.burst(self.lm.px(c.lane_x), PLAYER_Y - 60, CYAN, 8, 200, 4, 300)
+                self.burst(self.lm.px(c.lane_x), self.lm.gy - 60 * self.lm.sprite_k, CYAN, 8, 200, 4, 300)
         if not p.vulnerable():
             return
         for o in self.obstacles:
@@ -1594,8 +1731,8 @@ class GameState:
         self.score += 200
         self.sound("apple")
         sx = self.lm.px(c.lane_x)
-        self.particles.append(Particle(sx, PLAYER_Y - 200, 0, -80, 0.9, GOLD, kind="text", text="+200"))
-        self.burst(sx, PLAYER_Y - 150, GOLD, 12, 240, 5, 300)
+        self.particles.append(Particle(sx, self.lm.gy - 200 * self.lm.sprite_k, 0, -80, 0.9, GOLD, kind="text", text="+200"))
+        self.burst(sx, self.lm.gy - 150 * self.lm.sprite_k, GOLD, 12, 240, 5, 300)
         if self.apples % APPLES_PER_LIFE == 0 and self.lives < MAX_LIVES:
             self.lives += 1
             self.sound("oneup")
@@ -1626,7 +1763,7 @@ class GameState:
             self.level_tess = max(0, self.level_tess - lost)
             self.meter = max(0.0, self.meter - 25)
             self.meter_ready_said = self.meter >= 100
-            sx, sy = self.lm.px(p.x), PLAYER_Y - 90
+            sx, sy = self.lm.px(p.x), self.lm.gy - 90 * self.lm.sprite_k
             for _ in range(lost):                                    # scatter!
                 a = random.uniform(-math.pi, 0)
                 v = random.uniform(180, 420)
@@ -1647,6 +1784,135 @@ class GameState:
             self.mode = self.GAME_OVER
             self.sound("gameover")
             self.add_banner("THE TRICKSTER HAS FALLEN...", (255, 120, 120), 3.5)
+
+    # -- bosses ---------------------------------------------------------
+    def set_reverse(self, on):
+        """Flip the camera: Loki runs towards the screen and hazards rise from the bottom."""
+        self.reverse = on
+        self.lm.rev = on
+        self.player.front = on
+        self.obstacles.clear()
+        self.tesseracts.clear()
+        self.travel = -self.travel
+        self.shake = 0.6
+        self.flash, self.flash_color = 0.5, WHITE
+
+    def start_boss(self):
+        kind = self.level.boss
+        info = BOSS_INFO[kind]
+        self.boss = dict(kind=kind, hp=100.0, t=0.0, next=3.2, n=0, flash=0.0, dead=False, dt=0.0)
+        self.next_spawn = 1e9
+        self.pending_scenes.clear()
+        self.add_banner(info["intro"], info["color"], 3.0)
+        self.sound("roar")
+        self.shake = 0.8
+        if kind == "alioth":
+            self.set_reverse(True)
+
+    def damage_boss(self, amount):
+        b = self.boss
+        if b is None or b["dead"] or b["t"] < 1.5:
+            return
+        b["hp"] -= amount
+        b["flash"] = 0.18
+        self.sound("bosshit")
+
+    def update_boss(self, dt):
+        b = self.boss
+        p = self.player
+        if b["dead"]:
+            b["dt"] += dt
+            self.shake = max(self.shake, 0.1)
+            if random.random() < 0.5:
+                self.burst(random.uniform(W * 0.25, W * 0.75), random.uniform(HORIZON - 120, HORIZON + 60),
+                           random.choice(((255, 200, 60), (255, 110, 40), WHITE)), 10, 320, 6, 300)
+            if b["dt"] > 2.6:
+                if self.reverse:
+                    self.set_reverse(False)
+                self.boss = None
+                self.boss_done = True
+                self.finish_level()
+            return
+        b["t"] += dt
+        b["flash"] = max(0.0, b["flash"] - dt)
+        if b["t"] > 2.0:
+            b["hp"] -= 0.9 * dt                               # the boss tires out over time
+            if p.aura > 0:
+                b["hp"] -= 11.0 * dt                          # Glorious Purpose hurts bosses a lot
+                b["flash"] = 0.1
+            b["next"] -= dt
+            if b["next"] <= 0:
+                self.boss_attack()
+                b["next"] = 7.0 if self.reverse else 6.2
+        if b["hp"] <= 0:
+            b["dead"] = True
+            self.sound("bossdie")
+            self.shake = 1.0
+            self.flash, self.flash_color = 0.7, WHITE
+            self.add_banner(BOSS_INFO[b["kind"]]["defeat"], GOLD, 3.0)
+            for o in self.obstacles:
+                if o.blastable and o.active:
+                    o.blast(1 if o.lane_x >= p.x else -1)
+
+    def boss_attack(self):
+        """One attack cycle: a few rows of hazards plus six Tesseracts that hurt the boss when collected."""
+        b = self.boss
+        n = b["n"]
+        b["n"] += 1
+        kind = b["kind"]
+        rev = self.reverse
+        d0 = 28.0 if rev else 70.0
+        sp = 0.55 if rev else 1.0
+        lanes = [0, 1, 2]
+        pat = n % 3
+
+        def row(i):
+            return d0 + i * 20 * sp
+
+        def cubes(lane, d, count=2):
+            for j in range(count):
+                self.tesseracts.append(Tesseract(lane - 1, d - 2.5 + j * 2.4))
+
+        safe = random.choice(lanes)
+        for i in range(3):
+            d = row(i)
+            safe = int(clamp(safe + random.choice((-1, 0, 1)), 0, 2))
+            others = [ln for ln in lanes if ln != safe]
+            if kind == "hulk":
+                if pat == 0:                                        # fist barrage
+                    for ln in others:
+                        self.obstacles.append(Obstacle("fist", ln - 1, d))
+                elif pat == 1:                                      # thrown taxis
+                    for ln in random.sample(others, 1 if random.random() < 0.6 else 2):
+                        self.obstacles.append(Obstacle("taxi", ln - 1, d))
+                else:                                               # shockwaves: jump or dodge
+                    for ln in others:
+                        self.obstacles.append(Obstacle("shock", ln - 1, d))
+            elif kind == "thor":
+                if pat == 1:                                        # lightning strikes
+                    for ln in others:
+                        self.obstacles.append(Obstacle("shock", ln - 1, d))
+                else:                                               # Mjolnir barrage
+                    for ln in random.sample(others, 1 if pat == 0 else 2):
+                        self.obstacles.append(Obstacle.mjolnir(ln - 1, d))
+            else:                                                   # alioth (camera reversed)
+                if pat == 0:
+                    for ln in random.sample(others, 1 if random.random() < 0.5 else 2):
+                        self.obstacles.append(Obstacle("smoke", ln - 1, d))
+                elif pat == 1:
+                    for ln in random.sample(others, 2):
+                        self.obstacles.append(Obstacle("gator", ln - 1, d))
+                else:
+                    if i == 1:
+                        self.obstacles.append(Obstacle("ship", random.choice((-1, 1)), d))
+                        safe = 1 if self.obstacles[-1].lane_x < 0 else 1
+                    else:
+                        for ln in random.sample(others, 1):
+                            self.obstacles.append(Obstacle("smoke", ln - 1, d))
+            cubes(safe, d)
+        self.add_banner({"hulk": "HULK SMASH!", "thor": "BY ODIN'S BEARD!", "alioth": "ALIOTH ROARS!"}[kind]
+                        if n > 0 else "COLLECT CUBES TO HURT IT!", BOSS_INFO[kind]["color"], 1.6)
+        self.sound("roar")
 
     def update_scenes(self, dt):
         ld = self.level_dist
@@ -1707,6 +1973,7 @@ class GameState:
             ("TESSERACTS", str(self.level_tess), self.level_tess * 20, "cube"),
             ("GOLDEN APPLES", "%d / %d" % (self.level_apples, self.level_apples_spawned), self.level_apples * 150, "apple"),
             ("NO-HIT RUN", "PERFECT!" if hits == 0 else "%d HIT%s" % (hits, "" if hits == 1 else "S"), 1000 if hits == 0 else 0, "helmet"),
+            ("BOSS DEFEATED", BOSS_INFO[self.level.boss]["name"], 1500, "star"),
             ("LEVEL CLEARED", "", 1000, "flag"),
         ]
         total = sum(r[2] for r in rows)
@@ -1759,10 +2026,10 @@ class GameState:
         self.level_idx += 1
         self.begin_level()
         self.mode = self.PLAYING
-        self.card_t = 3.6
         self.flash, self.flash_color = 0.4, WHITE
         self.sound("start")
         self.particles.clear()
+        self.add_banner("LEVEL %d: %s" % (self.level.num, self.level.title), GOLD, 3.0)
 
     def victory(self):
         self.score += self.lives * 500
@@ -1871,6 +2138,10 @@ class Audio:
         S["tick"] = self.make(0.05, lambda b: T(b, 0, 0.04, 1400, 1400, "sq", 0.25, 0.25))
         S["ding"] = self.make(0.35, lambda b: (T(b, 0, 0.3, 1568, 1568, "sin", 0.5), T(b, 0, 0.3, 2093, 2093, "sin", 0.25)))
         S["roar"] = self.make(0.9, lambda b: (N(b, 0, 0.8, 0.7, 0.12, 0.05), T(b, 0, 0.8, 95, 60, "saw", 0.45, vib=0.05)))
+        S["thunder"] = self.make(0.7, lambda b: (N(b, 0, 0.6, 0.9, 0.2, 0.04), T(b, 0, 0.5, 1800, 120, "saw", 0.3)))
+        S["bosshit"] = self.make(0.18, lambda b: (T(b, 0, 0.15, 420, 150, "sq", 0.4, 0.5), N(b, 0, 0.1, 0.5, 0.5)))
+        S["bossdie"] = self.make(2.0, lambda b: (N(b, 0, 1.8, 0.9, 0.3, 0.02), T(b, 0, 1.8, 330, 40, "saw", 0.5, vib=0.04),
+                                                 T(b, 1.0, 0.9, 1047, 1568, "sq", 0.25, 0.25)))
         S["ready"] = self.make(0.4, lambda b: [T(b, j * 0.09, 0.15, f, f, "tri", 0.5) for j, f in enumerate((523, 659, 784, 1047))])
         S["hit"] = self.make(0.6, lambda b: (N(b, 0, 0.5, 0.9, 0.35, 0.05), T(b, 0, 0.5, 220, 50, "saw", 0.5)))
         S["fall"] = self.make(1.2, lambda b: T(b, 0, 1.15, 900, 70, "tri", 0.55, vib=0.03))
@@ -2026,6 +2297,38 @@ def draw_pursuer(surf, who, ax, ay, k, t):
             blit_glow(surf, ax + sgn * 76 * k, ay - 290 * k, 70 * k, (255, 230, 255), 160)
             ppoly(surf, (255, 245, 255), a, k, [(sgn * 30, -300), (sgn * 120, -330), (sgn * 128, -296), (sgn * 40, -276)])
             pcirc(surf, (190, 60, 220), a, k, sgn * 84, -306, 10)
+
+
+def draw_thor(surf, ax, ay, k, t, shout):
+    a = (ax, ay)
+    ppoly(surf, (190, 30, 40), a, k, [(-200, -40), (-130, -310), (130, -310), (200, -40), (130, 50), (-130, 50)])     # cape
+    ppoly(surf, (140, 20, 30), a, k, [(-200, -40), (-130, -310), (-60, -300), (-120, 40)])
+    pellipse(surf, (70, 90, 130), a, k, -125, -270, 250, 290)                                                        # armour
+    for dx, dy, r in ((-62, -180, 30), (62, -180, 30), (0, -150, 26)):
+        pcirc(surf, (200, 205, 220), a, k, dx, dy, r)
+        pcirc(surf, (120, 125, 145), a, k, dx, dy, r * 0.55)
+    prect(surf, (60, 40, 30), a, k, -120, -90, 240, 24)
+    for sgn in (-1, 1):                                                                                              # arms
+        pcirc(surf, (70, 90, 130), a, k, sgn * 135, -190, 38)
+    pline(surf, (225, 190, 150), a, k, 135, -190, 160 + math.sin(t * 6) * 10, -330, 30)                             # arm raised with hammer
+    pcirc(surf, (225, 190, 150), a, k, 160 + math.sin(t * 6) * 10, -345, 26)
+    pcirc(surf, (225, 190, 150), a, k, 0, -330, 66)                                                                  # head
+    ppoly(surf, (235, 195, 70), a, k, [(-72, -320), (-66, -400), (0, -420), (66, -400), (72, -320), (50, -360), (0, -350), (-50, -360)])   # hair
+    ppoly(surf, (235, 195, 70), a, k, [(-52, -300), (52, -300), (40, -250), (0, -236), (-40, -250)])                # beard
+    prect(surf, (200, 205, 220), a, k, -70, -392, 140, 22)                                                          # helmet band
+    for sgn in (-1, 1):
+        ppoly(surf, (225, 230, 240), a, k, [(sgn * 70, -384), (sgn * 180, -450), (sgn * 150, -392), (sgn * 200, -380), (sgn * 70, -366)])
+        pellipse(surf, WHITE, a, k, sgn * 30 - 16, -338, 32, 20)
+        pcirc(surf, (60, 160, 255), a, k, sgn * 30, -328, 7)
+    pellipse(surf, (110, 30, 40), a, k, -22, -276 - shout * 4, 44, 14 + shout * 10)                                  # shouting
+    hx, hy = 160 + math.sin(t * 6) * 10, -400                                                                        # Mjolnir overhead
+    prect(surf, (110, 70, 40), a, k, hx - 8, hy, 16, 80)
+    prect(surf, (190, 196, 210), a, k, hx - 62, hy - 56, 124, 62)
+    prect(surf, (120, 126, 142), a, k, hx - 62, hy - 22, 124, 28)
+    for j in range(5):                                                                                               # crackling lightning
+        x0 = hx + (hrand(j, int(t * 12)) - 0.5) * 220
+        y0 = hy - 40 + (hrand(j, 7, int(t * 12)) - 0.5) * 120
+        pline(surf, (190, 225, 255), a, k, x0, y0, x0 + (hrand(j, 3) - 0.5) * 90, y0 - 50, 4)
 
 
 def wrap_text(txt, size, maxw):
@@ -2190,18 +2493,21 @@ class Game:
         lm, lvl, p = st.lm, st.level, st.player
         lm.draw_ground(surf, lvl, st.travel)
         for o in st.obstacles:
-            if o.kind == "pit":
+            if o.ground:
                 o.draw_ground(surf, lm, lvl)
         lvl.draw_decor(surf, lm, st.travel)
+        if st.boss is not None:
+            self.draw_boss(surf)
         if st.chase is not None:
             gap = st.chase["gap"]
             draw_pursuer(surf, st.chase["who"], lm.px(p.x * 0.5) + math.sin(st.t * 9) * 5,
                          HORIZON + 30 + (1 - gap) * 150 + abs(math.sin(st.t * 8)) * 6, 0.42 + (1 - gap) * 0.9, st.t)
-        items = [(o.dist, 0, o) for o in st.obstacles if o.kind != "pit"]
+        items = [(o.dist, 0, o) for o in st.obstacles if not o.ground]
         items += [(c.dist, 1, c) for c in st.tesseracts]
         if st.mode != st.LEVEL_BREAK:
             items.append((0.0, 2, p))
-        items.sort(key=lambda it: (-it[0], it[1]))
+        sgn = 1 if lm.rev else -1                      # far objects first (reversed camera: nearest to the camera = highest dist)
+        items.sort(key=lambda it: (sgn * it[0], it[1]))
         for _, _, obj in items:
             if obj is p:
                 p.draw(surf, st.t)
@@ -2211,6 +2517,38 @@ class Game:
             part.draw(surf)
         if st.player.aura > 0 and FX["tint"]:                      # green screen tint
             fill_alpha(surf, (0, 0, W, H), (40, 255, 120), 26 + 10 * math.sin(st.t * 12))
+
+    def draw_boss(self, surf):
+        st = self.state
+        b = st.boss
+        lm = st.lm
+        info = BOSS_INFO[b["kind"]]
+        t = st.t
+        e = clamp(b["t"] / 2.0, 0, 1)
+        e = 1 - (1 - e) ** 3
+        hurt = b["flash"] > 0
+        dead_off = b["dt"] * 160 if b["dead"] else 0
+        jitter = (random.randint(-5, 5) if (hurt or b["dead"]) else 0)
+        if b["kind"] == "alioth":
+            k = 1.15 - 0.3 * (1 - clamp(b["hp"] / 100.0, 0, 1))
+            fill_alpha(surf, (0, 0, W, HORIZON + 90), (60, 14, 100), 120)
+            ax, ay = W / 2 + jitter, HORIZON + 190 + (1 - e) * 220 + dead_off + math.sin(t * 3) * 8
+            draw_pursuer(surf, "alioth", ax, ay, k, t)
+            for sgn in (-1, 1):                              # tendrils creeping in from the sides
+                for j in range(6):
+                    cx = W / 2 + sgn * (W * 0.52 - j * 26 + math.sin(t * 2 + j) * 12)
+                    pygame.draw.circle(surf, (50 + j * 6, 16, 80 + j * 8), (int(cx), int(HORIZON + 80 + j * 40)), 60 - j * 6)
+            if hurt:
+                blit_glow(surf, ax, ay - 200 * k * 0.5, 190, WHITE, 150)
+            return
+        ax = lm.px(0) + jitter
+        ay = HORIZON + 150 + (1 - e) * 260 + abs(math.sin(t * 4)) * 6 + dead_off
+        if b["kind"] == "hulk":
+            draw_pursuer(surf, "hulk", ax, ay, 0.5, t)
+        else:
+            draw_thor(surf, ax, ay, 0.5, t, abs(math.sin(t * 5)))
+        if hurt:
+            blit_glow(surf, ax, ay - 190 * 0.5, 130, WHITE, 150)
 
     # -- HUD ----------------------------------------------------------------
     @staticmethod
@@ -2226,25 +2564,37 @@ class Game:
         st = self.state
         lvl = st.level
         # top-left: level, name, distance
-        fill_alpha(surf, (10, 10, 480, 124), (8, 10, 24), 215)
-        pygame.draw.rect(surf, GOLD, (10, 10, 480, 124), 2)
+        fill_alpha(surf, (10, 10, 450, 124), (8, 10, 24), 215)
+        pygame.draw.rect(surf, GOLD, (10, 10, 450, 124), 2)
         draw_text(surf, f"LEVEL {lvl.num} / 3", 34, GOLD, (24, 16), "topleft", ow=3)
         draw_text(surf, lvl.title, 22, WHITE, (24, 54), "topleft", ow=2)
         left = max(0, int(lvl.length - st.level_dist))
-        draw_text(surf, f"DISTANCE LEFT: {left} m", 28, (160, 255, 190), (24, 80), "topleft", ow=3)
+        if st.boss is not None:
+            draw_text(surf, "BOSS FIGHT!", 28, (255, 120, 100), (24, 80), "topleft", ow=3)
+        else:
+            draw_text(surf, f"DISTANCE LEFT: {left} m", 28, (160, 255, 190), (24, 80), "topleft", ow=3)
         frac = clamp(st.level_dist / lvl.length, 0, 1)
-        pygame.draw.rect(surf, (30, 30, 40), (24, 116, 452, 10))
-        pygame.draw.rect(surf, GREEN, (24, 116, int(452 * frac), 10))
-        pygame.draw.rect(surf, WHITE, (24, 116, 452, 10), 1)
+        pygame.draw.rect(surf, (30, 30, 40), (24, 116, 422, 10))
+        pygame.draw.rect(surf, GREEN if st.boss is None else (255, 90, 80), (24, 116, int(422 * (frac if st.boss is None else 1)), 10))
+        pygame.draw.rect(surf, WHITE, (24, 116, 422, 10), 1)
         # top-right: score, tesseracts, apples
-        fill_alpha(surf, (W - 290, 10, 280, 124), (8, 10, 24), 215)
-        pygame.draw.rect(surf, GOLD, (W - 290, 10, 280, 124), 2)
+        fill_alpha(surf, (W - 270, 10, 260, 124), (8, 10, 24), 215)
+        pygame.draw.rect(surf, GOLD, (W - 270, 10, 260, 124), 2)
         draw_text(surf, "SCORE", 18, (190, 200, 220), (W - 24, 14), "topright", ow=2)
         draw_text(surf, f"{int(st.score):07d}", 46, WHITE, (W - 24, 30), "topright", ow=3)
-        draw_cube(surf, W - 262, 104, 15, st.t * 3, glow=False)
-        draw_text(surf, f"x {st.tess}", 34, CYAN, (W - 240, 86), "topleft", ow=3)
-        draw_apple(surf, W - 140, 106, 13, st.t)
-        draw_text(surf, f"x {st.apples}", 34, GOLD, (W - 120, 86), "topleft", ow=3)
+        draw_cube(surf, W - 244, 104, 15, st.t * 3, glow=False)
+        draw_text(surf, f"x {st.tess}", 34, CYAN, (W - 222, 86), "topleft", ow=3)
+        draw_apple(surf, W - 126, 106, 13, st.t)
+        draw_text(surf, f"x {st.apples}", 34, GOLD, (W - 106, 86), "topleft", ow=3)
+        if st.boss is not None:                                           # boss health bar
+            b = st.boss
+            info = BOSS_INFO[b["kind"]]
+            bx0, by0, bw0, bh0 = 470, 20, 210, 34
+            fill_alpha(surf, (bx0 - 6, by0 - 6, bw0 + 12, bh0 + 12), (8, 10, 24), 225)
+            pygame.draw.rect(surf, (60, 20, 24), (bx0, by0, bw0, bh0))
+            pygame.draw.rect(surf, info["color"], (bx0, by0, int(bw0 * clamp(b["hp"] / 100.0, 0, 1)), bh0))
+            pygame.draw.rect(surf, WHITE, (bx0, by0, bw0, bh0), 3)
+            draw_text(surf, info["name"], 22, WHITE, (bx0 + bw0 // 2, by0 + bh0 // 2), "center", ow=3)
         # bottom-left: lives
         n = min(MAX_LIVES, max(START_LIVES, st.lives))
         fill_alpha(surf, (10, H - 82, 40 + n * 44, 72), (8, 10, 24), 215)
@@ -2268,7 +2618,7 @@ class Game:
     def draw_banners(self, surf):
         st = self.state
         for i, b in enumerate(st.banners):
-            b.draw(surf, 210 + i * 80)
+            b.draw(surf, 176 + i * 58)
 
     # -- overlays -------------------------------------------------------
     def draw_level_card(self, surf):
@@ -2322,26 +2672,31 @@ class Game:
                 break
             local = clamp((t - i * BREAK_ROW_T) / 0.8, 0, 1)
             revealed += int(pts * local)
-            y = 170 + i * 78
-            fill_alpha(surf, (40, y, 568, 66), (30, 34, 66), 230)
-            cx, cy = 76, y + 33
+            y = 156 + i * 66
+            fill_alpha(surf, (40, y, 568, 58), (30, 34, 66), 230)
+            cx, cy = 76, y + 29
             if icon == "cube":
                 draw_cube(surf, cx, cy, 18, t * 3, glow=False)
             elif icon == "apple":
                 draw_apple(surf, cx, cy + 3, 16, t)
             elif icon == "helmet":
                 self.helmet_icon(surf, cx, cy, 1.2)
+            elif icon == "star":
+                star = [(cx + math.sin(i * math.pi / 5) * (22 if i % 2 == 0 else 10),
+                         cy - math.cos(i * math.pi / 5) * (22 if i % 2 == 0 else 10)) for i in range(10)]
+                pygame.draw.polygon(surf, GOLD, star)
+                pygame.draw.polygon(surf, WHITE, star, 2)
             else:
                 pygame.draw.line(surf, WHITE, (cx - 14, cy + 20), (cx - 14, cy - 22), 4)
                 pygame.draw.polygon(surf, GOLD, [(cx - 12, cy - 22), (cx + 22, cy - 12), (cx - 12, cy)])
-            draw_text(surf, label, 28, WHITE, (110, y + 9), "topleft", ow=3)
-            draw_text(surf, val, 24, CYAN if icon != "helmet" else (160, 255, 190), (110, y + 38), "topleft", ow=2)
+            draw_text(surf, label, 26, WHITE, (110, y + 5), "topleft", ow=3)
+            draw_text(surf, val, 22, CYAN if icon != "helmet" else (160, 255, 190), (110, y + 33), "topleft", ow=2)
             col = GOLD if pts > 0 else (150, 150, 160)
-            draw_text(surf, "+%d" % int(pts * local), 40, col, (594, y + 33), "midright", ow=3)
+            draw_text(surf, "+%d" % int(pts * local), 40, col, (594, y + 29), "midright", ow=3)
         n = len(rows)
         if t >= n * BREAK_ROW_T:
-            draw_text(surf, "LEVEL BONUS", 28, (190, 200, 230), (60, 500), "topleft", ow=3)
-            draw_text(surf, "+%d" % b["total"], 52, WHITE, (594, 520), "midright", ow=4)
+            draw_text(surf, "LEVEL BONUS", 28, (190, 200, 230), (60, 506), "topleft", ow=3)
+            draw_text(surf, "+%d" % b["total"], 52, WHITE, (594, 524), "midright", ow=4)
             draw_text(surf, f"SCORE  {int(b['score0'] + b['total']):07d}", 34, GOLD, (324, 570), ow=4)
         if b["done"]:
             if int(st.t * 2.5) % 2 == 0:
@@ -2428,8 +2783,6 @@ class Game:
             if st.mode != st.VICTORY:
                 self.draw_hud(scr)
             self.draw_banners(scr)
-            if st.mode in (st.PLAYING, st.PAUSED):
-                self.draw_level_card(scr)
             if st.mode == st.PAUSED:
                 fill_alpha(scr, (0, 0, W, H), BLACK, 150)
                 draw_text(scr, "PAUSED", 110, GOLD, (W // 2, H // 2), ow=6)
